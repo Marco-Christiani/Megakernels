@@ -2,6 +2,7 @@ import heapq
 from dataclasses import dataclass, field, replace
 
 import torch
+from torch import Tensor
 
 from megakernels.instructions import (
     BaseGlobals,
@@ -151,14 +152,17 @@ def assign_dag_to_sms(schedule: Schedule) -> list[list[Instruction]]:
     return sm_queues
 
 
+def round_robin(stuff: list, num_buckets: int):
+    buckets = [[] for _ in range(num_buckets)]
+    for i, item in enumerate(stuff):
+        buckets[i % num_buckets].append(item)
+    return buckets
+
+
 def round_robin_assign_to_sms(
     instructions: list[Instruction], sm_count: int
 ) -> list[list[Instruction]]:
-    sm_queues = [[] for _ in range(sm_count)]
-    for i, instruction in enumerate(instructions):
-        sm_queues[i % sm_count].append(instruction)
-
-    return sm_queues
+    return round_robin(instructions, sm_count)
 
 
 def zig_zag_assign_to_sms(
@@ -282,7 +286,29 @@ def tensorize_instructions(
     globs: BaseGlobals,
     instruction_queues: list[list[Instruction]],
 ):
-    num_sms = globs.sm_count()
+    serialized, timings = convert_instruction_queues_to_tensor(
+        instruction_queues, globs.device
+    )
+
+    globs.instructions = serialized
+    globs.timings = timings
+
+
+def create_timing_tensor(
+    instruction_tensor: Tensor,
+):
+    return torch.zeros(
+        instruction_tensor.shape[:-1] + (TIMING_SLOTS,),
+        device=instruction_tensor.device,
+        dtype=torch.int32,
+    )
+
+
+def convert_instruction_queues_to_tensor(
+    instruction_queues: list[list[Instruction]],
+    device: torch.device | str,
+):
+    num_sms = len(instruction_queues)
 
     max_queue_len = max(len(queue) for queue in instruction_queues)
     for queue in instruction_queues:
@@ -292,17 +318,8 @@ def tensorize_instructions(
     for queue in instruction_queues:
         flattened.extend(serialize_and_pad(instruction) for instruction in queue)
 
-    device = globs.device
-
     serialized = torch.tensor(flattened, dtype=torch.int32, device=device).view(
         num_sms, -1, INTS_PER_INSTRUCTION
     )
 
-    timings = torch.zeros(
-        [num_sms, max_queue_len, TIMING_SLOTS],
-        dtype=torch.int32,
-        device=device,
-    )
-
-    globs.instructions = serialized
-    globs.timings = timings
+    return serialized

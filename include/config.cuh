@@ -21,6 +21,10 @@ struct default_config {
     // How many semaphores are available for dynamic use?
     static constexpr int DYNAMIC_SEMAPHORES = 32;
 
+    // Scheduling approach -- explicit SM scheduling or work stealing?
+    static constexpr bool ENABLE_GLOBAL_WORK_QUEUE = false;
+    static constexpr int  GLOBAL_WORK_QUEUE_PARTITIONS = 1; // Only used if ENABLE_GLOBAL_WORK_QUEUE is true, can help minimize overhead.
+
     // One controller warp, one load warp, one store warp, and one mma warp.
     static constexpr int NUM_CONSUMER_WARPS = 16;
     static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
@@ -51,9 +55,13 @@ struct default_config {
     static constexpr int NON_CONSUMER_REGISTERS = 64;
 };
 template <typename config>
-using instruction_layout = kittens::gl<int, 1, -1, -1, config::INSTRUCTION_WIDTH>;
+using instruction_layout = std::conditional_t<config::ENABLE_GLOBAL_WORK_QUEUE, kittens::gl<int, 1, 1, -1, config::INSTRUCTION_WIDTH>, kittens::gl<int, 1, -1, -1, config::INSTRUCTION_WIDTH>>;
 template <typename config>
-using timing_layout = kittens::gl<int, 1, -1, -1, config::TIMING_WIDTH>;
+using timing_layout = std::conditional_t<config::ENABLE_GLOBAL_WORK_QUEUE, kittens::gl<int, 1, 1, -1, config::TIMING_WIDTH>, kittens::gl<int, 1, -1, -1, config::TIMING_WIDTH>>;
+template <typename config, int NUM_DEVICES>
+using multigpu_instruction_layout = kittens::pgl<kittens::gl<int, 1, -1, -1, config::INSTRUCTION_WIDTH>, NUM_DEVICES, false>;
+template <typename config, int NUM_DEVICES>
+using multigpu_timing_layout = kittens::pgl<kittens::gl<int, 1, -1, -1, config::TIMING_WIDTH>, NUM_DEVICES, false>;
 
 template <typename config> void print_config() {
     std::cout << "---------------- CONFIG INFO ----------------" << std::endl;
@@ -62,6 +70,10 @@ template <typename config> void print_config() {
     std::cout << "INSTRUCTION_WIDTH: " << config::INSTRUCTION_WIDTH
               << std::endl;
     std::cout << "TIMING_WIDTH: " << config::TIMING_WIDTH << std::endl;
+    std::cout << "ENABLE_GLOBAL_WORK_QUEUE: " << config::ENABLE_GLOBAL_WORK_QUEUE << std::endl;
+    if constexpr (config::ENABLE_GLOBAL_WORK_QUEUE) {
+        std::cout << "GLOBAL_WORK_QUEUE_PARTITIONS: " << config::GLOBAL_WORK_QUEUE_PARTITIONS << std::endl;
+    }
     std::cout << "NUM_CONSUMER_WARPS: " << config::NUM_CONSUMER_WARPS
               << std::endl;
     std::cout << "NUM_WARPS: " << config::NUM_WARPS << std::endl;

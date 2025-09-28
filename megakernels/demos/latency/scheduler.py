@@ -64,8 +64,8 @@ def make_globals(
         # model params
         qkv_proj_weights=stacked_params.qkv_proj,
         o_proj_weights=stacked_params.o_proj,
-        attn_ln_weights=stacked_params.attn_ln_weight,
-        mlp_ln_weights=stacked_params.mlp_ln_weight,
+        attn_ln_weights=stacked_params.attn_norm_weight,
+        mlp_ln_weights=stacked_params.mlp_norm_weight,
         up_proj_weights=stacked_params.up_proj,
         gate_proj_weights=stacked_params.gate_proj,
         down_proj_weights=stacked_params.down_proj,

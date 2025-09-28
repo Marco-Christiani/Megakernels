@@ -66,7 +66,7 @@ template <typename Config, typename Globals> struct rms_lm_head {
             kittens::warp::sync();
 
             if (kittens::warp::laneid() == 0) {
-                s.record(megakernel::TEVENT_OUTPUT_READY);
+                s.storer_record(STORE_EVENT);
 
                 kittens::tma::store_async<cache_policy::EVICT_LAST>(
                     g.logits, logits_smem_bf, {0, 0, 0, block_idx});

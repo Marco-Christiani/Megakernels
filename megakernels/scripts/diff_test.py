@@ -49,16 +49,20 @@ class ScriptConfig(pydra.Config):
 
     def th(self, bs=1024, sl=128):
         self.setting = "throughput"
-        self.mk_dir = (
-            Path(__file__).parent.parent.parent.parent
-            / "tests"
-            / "batch-vm"
-            / "llama_official"
-        )
+        self.mk_dir = Path(__file__).parent.parent.parent / "demos" / "high-throughput-llama"
         self.batch_size = bs
         self.skip_cost = True
         self.max_len_override = sl
-        self.interleave_rope = False
+        self.interleave_rope = True
+        self.l8()
+
+    def th_h100(self, bs=256, sl=128):
+        self.setting = "throughput"
+        self.mk_dir = Path(__file__).parent.parent.parent / "demos" / "high-throughput-llama"
+        self.batch_size = bs
+        self.skip_cost = True
+        self.max_len_override = sl
+        self.interleave_rope = True
         self.l8()
 
     def l1(self):

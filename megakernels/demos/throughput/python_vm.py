@@ -16,9 +16,7 @@ from megakernels.demos.throughput.instructions import (
     QKV_MatMulRopeAppend,
     UpMatMul,
 )
-from megakernels.llama import (
-    apply_rotary_pos_emb,
-)
+from megakernels.llama import apply_rotary_pos_emb, apply_rotary_pos_emb_interleaved
 from megakernels.python_vm import get_start_end, rms_norm
 from megakernels.utils import assert_div
 
@@ -46,28 +44,27 @@ def pre_attn_layer_norm(
     instruction: PreAttnLayerNorm,
 ):
     layer_idx = instruction.layer_idx
-    batch_idx = instruction.batch_start_idx
-    batch_block_idx = batch_idx // globals.matmul_batch_block_size
+    for batch_idx in instruction.batch_indices:
+        batch_block_idx = batch_idx // globals.matmul_batch_block_size
+        if layer_idx > 0:
+            assert (
+                globals.barriers[
+                    layer_idx - 1, instruction.prev_opcode() - 1, batch_block_idx, 0
+                ]
+                == globals.num_output_blocks()
+            )
 
-    if layer_idx > 0:
-        assert (
-            globals.barriers[
-                layer_idx - 1, instruction.prev_opcode() - 1, batch_block_idx, 0
-            ]
-            == globals.num_output_blocks()
+        pre_attn_ln = rms_norm(
+            inp=globals.hidden_states[batch_idx],
+            weight=globals.attn_ln_weights[layer_idx],
+            eps=globals.rms_norm_eps,
         )
 
-    pre_attn_ln = rms_norm(
-        inp=globals.hidden_states[batch_idx],
-        weight=globals.attn_ln_weights[layer_idx],
-        eps=globals.rms_norm_eps,
-    )
+        globals.rms_rope_intermediates[batch_idx] = pre_attn_ln
 
-    globals.rms_rope_intermediates[batch_idx] = pre_attn_ln
-
-    # barrier update
-    batch_block_idx = batch_idx // globals.matmul_batch_block_size
-    globals.barriers[layer_idx, instruction.opcode() - 1, batch_block_idx, 0] += 1
+        # barrier update
+        batch_block_idx = batch_idx // globals.matmul_batch_block_size
+        globals.barriers[layer_idx, instruction.opcode() - 1, batch_block_idx, 0] += 1
 
 
 def qkv_matmul_rope_append(
@@ -117,8 +114,7 @@ def qkv_matmul_rope_append(
     if mode in "qk":
         arr = rearrange(output, "... (h d) -> ... h d", d=globals.head_dim)
 
-        # not interleaved for big-batch version
-        with_rope, _ = apply_rotary_pos_emb(
+        with_rope, _ = apply_rotary_pos_emb_interleaved(
             q=arr,
             k=arr,
             cos=globals.rope_cos[pos_id],
@@ -420,7 +416,6 @@ def pre_lm_head_rms(
     ] += 1
 
 
-# TODO Split this out for the throughput setting into RMS and LM Head
 def lm_head(
     globals: Globals,
     instruction: LM_Head,

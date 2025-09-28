@@ -1,4 +1,6 @@
 local/
+build/
+
 __pycache__/
 *.egg-info/
 

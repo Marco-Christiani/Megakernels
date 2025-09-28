@@ -36,7 +36,6 @@ def interpret_with_mk(
         globs.rms_rope_intermediates,
         globs.rms_gate_intermediates,
         # globs.gate_silu_intermediates,
-        globs.silu_out,
         globs.post_ln_rope_q,
         globs.attn_out,
         globs.silu_out,
@@ -47,69 +46,6 @@ def interpret_with_mk(
         globs.rms_norm_eps,
         globs.batch_size,
     )
-
-    # mk_llama(
-    #     Bar,
-    #     instructions,
-    #     timings,
-    #     qkv_weights,
-    #     attn_norm_weights,
-    #     o_weights,
-    #     mlp_norm_weights,
-    #     up_weights,
-    #     gate_weights,
-    #     down_weights,
-    #     lm_head_norm_weights,
-    #     lm_head_weights,
-    #     k_cache,
-    #     v_cache,
-    #     rope_cos,
-    #     rope_sin,
-    #     hidden_states,
-    #     rms_rope_intermediates,
-    #     rms_gate_intermediates,
-    #     gate_silu_intermediates,
-    #     q_post_rope,
-    #     attn_out,
-    #     silu_out,
-    #     logits,
-    #     pos_id,
-    #     attn_scale,
-    #     rms_norm_eps
-    # )
-
-    # mk_func(
-    #     # vm stuff
-    #     globs.barriers,
-    #     globs.instructions,
-    #     globs.timings,
-    #     # weights
-    #     globs.qkv_proj,
-    #     globs.attn_ln_weight,
-    #     globs.o_proj,
-    #     globs.mlp_ln_weight,
-    #     globs.up_proj,
-    #     globs.gate_proj,
-    #     globs.down_proj,
-    #     globs.lm_head_norm_weights.data,
-    #     globs.lm_head_weights.data,
-    #     globs.k_cache,
-    #     globs.v_cache,
-    #     # rope
-    #     globs.rope_cos,
-    #     globs.rope_sin,
-    #     # activations
-    #     globs.hidden_states,
-    #     globs.post_ln_rope_q,
-    #     globs.attn_out,
-    #     globs.silu_out,
-    #     globs.logits,
-    #     # scalars
-    #     globs.pos_id,
-    #     globs.attn_scale,
-    #     globs.rms_norm_eps,
-    # )
-
 
 class ThroughputMK_Interpreter(MK_Interpreter):
     def interpret(self, globs: Globals):

@@ -5,7 +5,6 @@ using namespace kittens;
 using namespace megakernel;
 
 using globals = llama_1b_globals;
-using config = default_config;
 
 template <typename Config, typename Globals> struct rms_upgate_silu {
     static constexpr int opcode =
@@ -106,11 +105,12 @@ template <typename Config, typename Globals> struct rms_upgate_silu {
             kittens::warp::sync();
 
             if (kittens::laneid() == 0) {
+                s.storer_record(STORE_EVENT);
                 kittens::tma::store_async<cache_policy::EVICT_LAST>(g.silu_out, out_smem,
                                                            {block_idx});
                 kittens::tma::store_async_wait();
 
-                s.record(megakernel::TEVENT_AT_GMEM_STORE);
+                s.storer_record(STORE2_EVENT);
                 // asm volatile("fence.acq_rel.gpu;");
 
                 parsed_instruction inst{s};
@@ -118,8 +118,6 @@ template <typename Config, typename Globals> struct rms_upgate_silu {
                                   block_idx * globals::matvec_block_size /
                                       globals::hidden_dim}],
                           1);
-
-                s.record(megakernel::TEVENT_DONE_GMEM_STORE);
             }
 
             kittens::warp::sync();

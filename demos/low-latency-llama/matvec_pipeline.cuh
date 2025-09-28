@@ -2,6 +2,9 @@
 
 #include "llama.cuh"
 
+using namespace kittens;
+using namespace megakernel;
+
 template <typename Config, typename Globals, typename parsed_instruction,
           typename pipeline_specifics>
 struct matvec_pipeline {
@@ -140,10 +143,8 @@ struct matvec_pipeline {
                     auto &weight_chunk = reinterpret_cast<kittens::st_bf<16, 512> &>(
                         s.pages[weight_page]);
 
-                    if (iter == 0 && i == 0) {
-                        s.record(megakernel::TEVENT_FIRST_LOAD);
-                    } else if (iter == inst.iters - 1 && i == 3) {
-                        s.record(megakernel::TEVENT_LAST_LOAD);
+                    if (iter == 0 || iter == inst.iters - 1) {
+                        s.loader_record(LOAD_EVENT);
                     }
 
                     pipeline_specifics::load_iter(s, g, inst, iter, i,
@@ -186,10 +187,10 @@ struct matvec_pipeline {
                 get_output_start(s, output_stage) +
                 (kittens::warpid() * SCRATCH_BYTES_PER_WARP));
 
-            if (i == 0) {
-                s.record(megakernel::TEVENT_FIRST_USE);
+            if (i < 15) {
+                s.consumer_record(COMPUTE_EVENT);
             } else if (i == inst.iters - 1) {
-                s.record(megakernel::TEVENT_LAST_USE);
+                s.consumer_record(COMPUTE2_EVENT);
             }
 
             matvec(out_smem, weights, activations_vec);
@@ -224,10 +225,8 @@ struct matvec_pipeline {
 
             kittens::wait(sem, bit);
 
-            if (i == 0) {
-                s.record(megakernel::TEVENT_FIRST_STORE);
-            } else if (i == inst.iters - 1) {
-                s.record(megakernel::TEVENT_LAST_STORE);
+            if (i < 15 || i == inst.iters - 1) {
+                s.storer_record(STORE_EVENT);
             }
 
             pipeline_specifics::store(s, g, inst, i, output_stage);
@@ -322,9 +321,9 @@ struct rms_matvec_pipeline
             // kittens::tma::expect(sem, activations);
 
             // Activation
-            s.record(megakernel::TEVENT_AT_GMEM_WAIT);
+            s.consumer_record(WAIT_EVENT);
             pipeline_specifics::gmem_wait(g, s);
-            s.record(megakernel::TEVENT_DONE_GMEM_WAIT);
+            s.consumer_record(READY_EVENT);
 
             // kittens::tma::load_async<cache_policy::EVICT_LAST>(activations, g.*ActPtr,
             // {}, sem);

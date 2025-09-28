@@ -180,7 +180,7 @@ template <typename Config, typename Globals> struct attention_reduction {
 
                 parsed_instruction inst{s};
 
-                s.record(megakernel::TEVENT_AT_GMEM_WAIT);
+                s.launcher_record(WAIT_EVENT);
                 while (*(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1,
                                                 inst.q_head_start_idx + 0}] <
                            inst.num_partials ||
@@ -195,7 +195,7 @@ template <typename Config, typename Globals> struct attention_reduction {
                            inst.num_partials) {
                     __nanosleep(Config::GMEM_SPIN_LOOP_SLEEP_NANOS);
                 }
-                s.record(megakernel::TEVENT_DONE_GMEM_WAIT);
+                s.launcher_record(READY_EVENT);
 
                 for (int i = 0; i < 4; ++i) {
                     l_partial_sv &L_smem = get_L_partial_smem(s, i);
@@ -246,7 +246,7 @@ template <typename Config, typename Globals> struct attention_reduction {
 
                 kittens::warp::wait(L_partial_all_arrived(s, q_head_local_idx), 0);
                 if (kittens::laneid() == 0)
-                    s.record(megakernel::TEVENT_CONSUMER_START + 16 + kittens::warpid());
+                    s.consumer_record(COMPUTE_EVENT);
                 l_partial_sv &L_smem = get_L_partial_smem(s, q_head_local_idx);
 
                 // --- Reduction Pipeline ---
@@ -312,7 +312,7 @@ template <typename Config, typename Globals> struct attention_reduction {
                     get_O_final_smem(s, q_head_local_idx);
                 kittens::wait(final_O_ready(s, q_head_local_idx), 0);
                 if (kittens::warp::laneid() == 0) {
-                    s.record(megakernel::TEVENT_OUTPUT_READY);
+                    s.storer_record(STORE_EVENT);
                 }
 
                 kittens::tma::store_async<cache_policy::NORMAL>(
@@ -327,13 +327,12 @@ template <typename Config, typename Globals> struct attention_reduction {
 
             kittens::warp::sync();
             if (kittens::warp::laneid() == 0) {
-                s.record(megakernel::TEVENT_AT_GMEM_STORE);
+                s.storer_record(STORE2_EVENT);
                 // asm volatile("fence.acq_rel.gpu;");
 
                 // simple signalling strat for now
                 atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, 0}],
                           Q_HEADS_PER_INSTRUCTION);
-                s.record(megakernel::TEVENT_DONE_GMEM_STORE);
             }
         }
     };

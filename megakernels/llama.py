@@ -94,13 +94,21 @@ def attention(
     kv_cache: KV_Cache,
     position_ids: Tensor,
     seq_len: int,
+    layer_idx: int = 0,
 ) -> Tensor:
     bsz, new_tok_seq_len = query_states.shape[:2]
 
     k_cache, v_cache = kv_cache
 
-    k_cache[:, position_ids] = key_states
-    v_cache[:, position_ids] = value_states
+    # added for tensor parallel
+    bsz_live = key_states.size(0)
+    bsz_cache = k_cache.size(0)
+    repeat_factor = bsz_cache // bsz_live
+    key_broadcast = key_states.repeat_interleave(repeat_factor, dim=0)
+    value_broadcast = value_states.repeat_interleave(repeat_factor, dim=0)
+
+    k_cache[:, position_ids.squeeze()] = key_broadcast  # key_states
+    v_cache[:, position_ids.squeeze()] = value_broadcast  # value_states
 
     def shape_for_sdpa(x: Tensor):
         return rearrange(x, "b l h d -> b h l d")
@@ -124,6 +132,10 @@ def attention(
         v_for_sdpa = shape_for_sdpa(v_cache[:, :seq_len])
 
         q_for_sdpa = shape_for_sdpa(query_states)
+
+        # if layer_idx == 0:
+        #     print(f"{q_for_sdpa.shape=}, {k_for_sdpa.shape=}, {v_for_sdpa.shape=}")
+        # q_for_sdpa.shape=torch.Size([1024, 8, 1, 128]), k_for_sdpa.shape=torch.Size([1024, 1, 22, 128]), v_for_sdpa.shape=torch.Size([1024, 1, 22, 128])
 
         attn_output = F.scaled_dot_product_attention(
             q_for_sdpa, k_for_sdpa, v_for_sdpa, is_causal=False, enable_gqa=True
@@ -169,6 +181,18 @@ def apply_rotary_pos_emb_interleaved(
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+
+    # if we need to expand for tensor parallel
+    q_shape = q.shape
+    cos_shape = cos.shape
+    block_size = q_shape[0] // cos_shape[0]
+    cos = cos.repeat_interleave(block_size, dim=0)
+    sin = sin.repeat_interleave(block_size, dim=0)
+
+    if len(cos_shape) == 2:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
     q_embed = (q * cos) + (rotate_half_interleaved(q) * sin)
     k_embed = (k * cos) + (rotate_half_interleaved(k) * sin)
     return q_embed, k_embed
@@ -255,6 +279,10 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, seq_len, self.num_kv_heads, -1)
         value_states = value_states.view(bsz, seq_len, self.num_kv_heads, -1)
 
+        # if self.layer_idx == 0:
+        #     print(f"{query_states.shape=}, {key_states.shape=}, {value_states.shape=}")
+        #     # query_states.shape=torch.Size([1024, 1, 8, 128]), key_states.shape=torch.Size([1024, 1, 1, 128]), value_states.shape=torch.Size([1024, 1, 1, 128])
+
         cos, sin = batch_state.position_embeddings
 
         dtype = query_states.dtype
@@ -285,10 +313,20 @@ class LlamaAttention(nn.Module):
         )
 
         attn_output = raw_attn_output.reshape(bsz, seq_len, -1)
+        # if self.layer_idx == 0:
+        #     print(f"Before - attn_output shape: {attn_output.shape}")
+        #     # Before - attn_output shape: torch.Size([1024, 1, 1024])
 
         o_proj = self.o_proj(attn_output)
+        # if self.layer_idx == 0:
+        #     print(f"Before - o_proj shape: {o_proj.shape}")
+        # Before - o_proj shape: torch.Size([1024, 1, 8192])
 
         o_proj = reduce_scatter(o_proj, self.extra_config)
+
+        # if self.layer_idx == 0:
+        #     print(f"After - o_proj shape: {o_proj.shape}")
+        # After - o_proj shape: torch.Size([128, 1, 8192])
 
         with_residual = residual + o_proj
 
@@ -333,10 +371,22 @@ class LlamaMLP(nn.Module):
         assert inp is not None
         hidden_states = self.input_layernorm(inp)
 
+        # if self.layer_idx == 0:
+        #     print(f"MLP Input shape: {hidden_states.shape}")
+        #     # MLP Input shape: torch.Size([128, 1, 8192])
+
         hidden_states = all_gather(hidden_states, self.extra_config)
+
+        # if self.layer_idx == 0:
+        #     print(f"MLP Input after gather shape: {hidden_states.shape}")
+        #     # MLP Input after gather shape: torch.Size([1024, 1, 8192])
 
         up = self.up_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
+        # if self.layer_idx == 0:
+        #     print(f"{self.gate_proj.weight.shape=}, {gate.shape=}")
+        #     self.gate_proj.weight.shape=torch.Size([3584, 8192]), gate.shape=torch.Size([1024, 1, 3584])
+
         prod = F.silu(gate) * up
         down = self.down_proj(prod)
 
@@ -395,9 +445,9 @@ class LlamaLMHead(nn.Module):
 
         next_token_ids = logits.argmax(dim=-1)
 
-        if self.tp_size > 1:
-            # TODO: fusion
-            next_token_ids = all_gather(next_token_ids, self.extra_config)
+        # if self.tp_size > 1:
+        #     # TODO: fusion
+        #     next_token_ids = all_gather(next_token_ids, self.extra_config)
 
         batch_state.output_ids = next_token_ids
         return batch_state
@@ -474,6 +524,46 @@ class LlamaModel(nn.Module):
                 mod.q_proj.weight[:] = mod.q_proj.weight[indices_for_q]
                 mod.k_proj.weight[:] = mod.k_proj.weight[indices_for_k]
 
+    def interleave_rope_tp(self, tp_rank: int, tp_size: int):
+        indices_for_q_list = []
+        half_head_dim = self.config.head_dim // 2
+        for n in range(self.config.num_attention_heads):
+            offset = n * self.config.head_dim
+            for i in range(half_head_dim):
+                indices_for_q_list.append(i + offset)
+                indices_for_q_list.append(i + half_head_dim + offset)
+
+        indices_for_q = torch.tensor(indices_for_q_list, device=self.rope_cos.device)
+        one_head_indices = indices_for_q[: self.config.head_dim]
+
+        self.rope_cos = self.rope_cos[..., one_head_indices]
+        self.rope_sin = self.rope_sin[..., one_head_indices]
+
+        indices_for_k = indices_for_q[
+            : self.config.head_dim * self.config.num_key_value_heads
+        ]
+
+        # start offset
+        local_q_heads = self.config.num_attention_heads // tp_size
+        local_kv_heads = self.config.num_key_value_heads // tp_size
+
+        rows_per_q = local_q_heads * self.config.head_dim
+        rows_per_kv = local_kv_heads * self.config.head_dim
+
+        q_start = tp_rank * rows_per_q
+        q_end = q_start + rows_per_q
+        k_start = tp_rank * rows_per_kv
+        k_end = k_start + rows_per_kv
+
+        local_q = indices_for_q[q_start:q_end] - q_start  # 0-based inside shard
+        local_k = indices_for_k[k_start:k_end] - k_start
+        # end offset
+
+        for mod in self.modules():
+            if isinstance(mod, LlamaAttention):
+                mod.q_proj.weight[:] = mod.q_proj.weight[local_q]
+                mod.k_proj.weight[:] = mod.k_proj.weight[local_k]
+
     def forward(self, batch_state: BatchState):
         out: BatchState = self.embed_tokens(batch_state)
         assert self.rope_cos.dtype == torch.float32
@@ -491,11 +581,111 @@ class LlamaModel(nn.Module):
 class StackedParams:
     qkv_proj: Tensor
     o_proj: Tensor
-    attn_ln_weight: Tensor
-    mlp_ln_weight: Tensor
+    attn_norm_weight: Tensor
+    mlp_norm_weight: Tensor
     up_proj: Tensor
     gate_proj: Tensor
     down_proj: Tensor
+
+    lm_head_norm_weight: Tensor
+    lm_head: Tensor
+
+    embedding_table: Tensor
+
+    rope_cos: Tensor
+    rope_sin: Tensor
+
+    k_cache: Tensor
+    v_cache: Tensor
+
+    @classmethod
+    def from_config(
+        cls,
+        config: LlamaConfig,
+        tp_size: int,
+        device: DeviceType,
+        num_pages: int,
+        page_size: int,
+    ):
+        def make_tensor(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, device=device, dtype=dtype)
+
+        sharded_intermediate_size = config.intermediate_size // tp_size
+
+        num_sharded_q_heads = config.num_attention_heads // tp_size
+        num_sharded_kv_heads = config.num_key_value_heads // tp_size
+
+        kv_cache_shape = (
+            config.num_hidden_layers * num_pages,
+            page_size,
+            num_sharded_kv_heads,
+            config.head_dim,
+        )
+
+        return StackedParams(
+            qkv_proj=make_tensor(
+                (
+                    config.num_hidden_layers,
+                    (num_sharded_q_heads + 2 * num_sharded_kv_heads) * config.head_dim,
+                    config.hidden_size,
+                ),
+            ),
+            o_proj=make_tensor(
+                (
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    config.hidden_size,
+                ),
+            ),
+            attn_norm_weight=make_tensor(
+                (config.num_hidden_layers, config.hidden_size),
+            ),
+            mlp_norm_weight=make_tensor(
+                (config.num_hidden_layers, config.hidden_size),
+            ),
+            up_proj=make_tensor(
+                (
+                    config.num_hidden_layers,
+                    sharded_intermediate_size,
+                    config.hidden_size,
+                ),
+            ),
+            gate_proj=make_tensor(
+                (
+                    config.num_hidden_layers,
+                    sharded_intermediate_size,
+                    config.hidden_size,
+                ),
+            ),
+            down_proj=make_tensor(
+                (
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    sharded_intermediate_size,
+                ),
+            ),
+            lm_head_norm_weight=make_tensor(
+                (config.hidden_size,),
+            ),
+            lm_head=make_tensor(
+                (config.vocab_size, config.hidden_size),
+            ),
+            embedding_table=make_tensor(
+                (config.vocab_size, config.hidden_size),
+            ),
+            rope_cos=make_tensor(
+                (config.max_position_embeddings, config.head_dim), dtype=torch.float32
+            ),
+            rope_sin=make_tensor(
+                (config.max_position_embeddings, config.head_dim), dtype=torch.float32
+            ),
+            k_cache=make_tensor(
+                kv_cache_shape,
+            ),
+            v_cache=make_tensor(
+                kv_cache_shape,
+            ),
+        )
 
 
 class LlamaForCausalLM(nn.Module):
@@ -546,27 +736,48 @@ class LlamaForCausalLM(nn.Module):
 
         out = self.model(out)
         out = self.lm_head(out)
-
         return out
 
-    def setup_caches(self):
-        k_cache = torch.zeros(
-            (
-                self.config.num_hidden_layers,
-                self.extra_config.max_batch_size,
-                self.extra_config.max_len_override
-                or self.config.max_position_embeddings,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            ),
-            device=self.device,
-            dtype=self.dtype,
-        )
+    def setup_caches(self, tp_rank: int = 0, tp_size: int = 1):
+        if tp_size > 1:
+            local_kv_heads = self.num_kv_heads()
+
+            k_cache = torch.zeros(
+                (
+                    self.config.num_hidden_layers,
+                    self.extra_config.max_batch_size,
+                    self.extra_config.max_len_override
+                    or self.config.max_position_embeddings,
+                    local_kv_heads,  # was  self.config.num_key_value_heads
+                    self.config.head_dim,
+                ),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+        else:
+            k_cache = torch.zeros(
+                (
+                    self.config.num_hidden_layers,
+                    self.extra_config.max_batch_size,
+                    self.extra_config.max_len_override
+                    or self.config.max_position_embeddings,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                ),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
         v_cache = k_cache.clone()
 
         self.stacked_kv_cache = (k_cache, v_cache)
 
         for layer_idx in range(self.config.num_hidden_layers):
+            # if layer_idx == 0:
+            #     print(f"Setup Cache: {k_cache.shape=}, {v_cache.shape=}")
+            #     # Setup Cache: k_cache.shape=torch.Size([80, 1024, 128, 1, 128]), v_cache.shape=torch.Size([80, 1024, 128, 1, 128])
+
             layer: LlamaBlock = self.model.layers[layer_idx]  # type: ignore
             layer.self_attn.kv_cache = (
                 self.stacked_kv_cache[0][layer_idx],
@@ -587,11 +798,12 @@ class LlamaForCausalLM(nn.Module):
         extra_config: ExtraModelConfig | None = None,
         device: DeviceType | None = None,
         dtype: torch.dtype | None = None,
+        cache_dir: str | None = None,
     ):
         if extra_config is None:
             extra_config = ExtraModelConfig()
 
-        config: LlamaConfig = LlamaConfig.from_pretrained(model_name_or_path)  # type: ignore
+        config: LlamaConfig = LlamaConfig.from_pretrained(model_name_or_path)
         if extra_config.rope_scaling is not None:
             config.rope_scaling = extra_config.rope_scaling
 
@@ -608,12 +820,18 @@ class LlamaForCausalLM(nn.Module):
 
         if (as_path := Path(model_name_or_path)).exists():
             model_path = as_path
+        elif cache_dir is not None:
+            snapshot_path_str = huggingface_hub.snapshot_download(
+                model_name_or_path,
+                allow_patterns=["*.safetensors", "*.json"],
+                cache_dir=cache_dir,
+            )
+            model_path = Path(snapshot_path_str)
         else:
             snapshot_path_str = huggingface_hub.snapshot_download(
                 model_name_or_path,
                 allow_patterns=["*.safetensors", "*.json"],
             )
-
             model_path = Path(snapshot_path_str)
 
         model.load_from_safetensors(model_path)
@@ -630,10 +848,15 @@ class LlamaForCausalLM(nn.Module):
         model.requires_grad_(False)
 
         if extra_config.interleave_rope:
-            model.model.interleave_rope()
+            if extra_config.tp_size > 1:
+                model.model.interleave_rope_tp(
+                    extra_config.tp_rank, extra_config.tp_size
+                )
+            else:
+                model.model.interleave_rope()
 
-        model.stack_params()
-        model.setup_caches()
+        model.stack_params(extra_config.tp_rank, extra_config.tp_size)
+        model.setup_caches(extra_config.tp_rank, extra_config.tp_size)
 
         return model
 
@@ -710,7 +933,7 @@ class LlamaForCausalLM(nn.Module):
 
         self.load_state_dict(state_dict, assign=True, strict=True)
 
-    def stack_params(self):
+    def stack_params(self, tp_rank: int = 0, tp_size: int = 1):
         def stack_and_reassign(modules, prop: str):
             params = [getattr(m, prop) for m in modules]
             stacked = torch.stack(params, dim=0)
@@ -751,16 +974,38 @@ class LlamaForCausalLM(nn.Module):
 
         stacked_qkv_weights = torch.stack(qkv_weights, dim=0)
 
+        # if tp_rank == 0:
+        #     print(f"stacked_qkv_weights shape: {stacked_qkv_weights.shape}")
+        #     stacked_qkv_weights shape: torch.Size([80, 1280, 8192])
+
         for i, self_attn in enumerate(self_attns):
             qkv_weight = stacked_qkv_weights[i]
-            q_weight, k_weight, v_weight = qkv_weight.split(
-                [
-                    self.config.num_attention_heads * self.config.head_dim,
-                    self.config.num_key_value_heads * self.config.head_dim,
-                    self.config.num_key_value_heads * self.config.head_dim,
-                ],
-                dim=0,
-            )
+            if tp_size > 1:
+                local_q_heads = self.num_qo_heads()
+                local_kv_heads = self.num_kv_heads()
+                q_weight, k_weight, v_weight = qkv_weight.split(
+                    [
+                        local_q_heads * self.config.head_dim,
+                        local_kv_heads * self.config.head_dim,
+                        local_kv_heads * self.config.head_dim,
+                    ],
+                    dim=0,
+                )
+                # if tp_rank == 0:
+                # print(f"local_q_heads: {local_q_heads}, "
+                #       f"local_kv_heads: {local_kv_heads}, "
+                #       f"q_weight shape: {q_weight.shape}, "
+                #       f"k_weight shape: {k_weight.shape}, ")
+                # local_q_heads: 8, local_kv_heads: 1, q_weight shape: torch.Size([1024, 8192]), k_weight shape: torch.Size([128, 8192]),
+            else:
+                q_weight, k_weight, v_weight = qkv_weight.split(
+                    [
+                        self.config.num_attention_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                    ],
+                    dim=0,
+                )
 
             self_attn.q_proj.weight[:] = q_weight
             self_attn.k_proj.weight[:] = k_weight
@@ -774,4 +1019,11 @@ class LlamaForCausalLM(nn.Module):
             up_proj=stacked_up_proj,
             gate_proj=stacked_gate_proj,
             down_proj=stacked_down_proj,
+            lm_head_norm_weight=self.lm_head.input_norm.weight,
+            lm_head_weight=self.lm_head.lm_head.weight,
+            embedding_table=self.model.embed_tokens.embed_tokens.weight,
+            rope_cos=self.model.rope_cos,
+            rope_sin=self.model.rope_sin,
+            k_cache=self.stacked_kv_cache[0],
+            v_cache=self.stacked_kv_cache[1],
         )

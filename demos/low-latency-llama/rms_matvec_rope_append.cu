@@ -124,6 +124,7 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
             kittens::warp::store(qkv_proj_smem_bf, qkv_proj);
             kittens::warp::sync();
 
+            s.storer_record(STORE_EVENT);
             if (kittens::laneid() == 0) {
 
                 if (block_idx < K_BLK_START) { // Q
@@ -151,8 +152,6 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
                          dim_idx});
                 }
 
-                s.record(megakernel::TEVENT_AT_GMEM_STORE);
-
                 kittens::tma::store_async_wait(); // not just read wait! full wait! must
                                          // be visible in global!
                 // asm volatile("fence.acq_rel.gpu;\n"); // possible we need sc
@@ -160,7 +159,7 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
 
                 atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, block_idx / 4}],
                           1);
-                s.record(megakernel::TEVENT_DONE_GMEM_STORE);
+                s.storer_record(STORE2_EVENT);
             }
 
             kittens::warp::sync();

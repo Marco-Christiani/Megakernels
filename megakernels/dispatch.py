@@ -6,8 +6,12 @@ from megakernels.demos.latency.python_vm import (
 )
 from megakernels.demos.latency.scheduler import LatencyScheduleBuilder
 from megakernels.demos.throughput.mk import ThroughputMK_Interpreter
+from megakernels.demos.tp_throughput.mk import TensorParallelMK_Interpreter
 from megakernels.demos.throughput.python_vm import (
     INSTRUCTION_TO_SOLVER as THROUGHPUT_INSTRUCTION_TO_SOLVER,
+)
+from megakernels.demos.tp_throughput.python_vm import (
+    INSTRUCTION_TO_SOLVER as TP_INSTRUCTION_TO_SOLVER,
 )
 from megakernels.demos.throughput.scheduler import ThroughputScheduleBuilder
 from megakernels.mk import MK_Interpreter
@@ -22,11 +26,13 @@ BUILDER_MAP = {
 MK_INTERPRETER_MAP = {
     "latency": LatencyMK_Interpreter,
     "throughput": ThroughputMK_Interpreter,
+    "tensorparallel": TensorParallelMK_Interpreter, 
 }
 
 INSTRUCTION_TO_SOLVER_MAP = {
     "latency": LATENCY_INSTRUCTION_TO_SOLVER,
     "throughput": THROUGHPUT_INSTRUCTION_TO_SOLVER,
+    "tensorparallel": TP_INSTRUCTION_TO_SOLVER, 
 }
 
 

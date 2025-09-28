@@ -61,7 +61,7 @@ class PreAttnLayerNorm(MemoryInstruction):
     """
 
     layer_idx: int
-    batch_start_idx: int
+    batch_indices: list[int]
 
     @classmethod
     def opcode(cls) -> int:
@@ -134,7 +134,7 @@ class PreMLP_Norm(MemoryInstruction):
     """
 
     layer_idx: int
-    batch_start_idx: int
+    batch_indices: list[int]
 
     @classmethod
     def opcode(cls) -> int:
@@ -198,7 +198,7 @@ class DownProjResidual(MatMulAdd):
 class PreLMHeadRMS(MemoryInstruction):
     # layer idx is fake but convenient so we can reuse cuda code
     layer_idx: int
-    batch_start_idx: int
+    batch_indices: list[int]
 
     @classmethod
     def opcode(cls) -> int:

@@ -104,10 +104,7 @@ class Instruction:
 
             if isinstance(attr, int):
                 words.append(attr)
-            elif isinstance(attr, tuple):
-                words.append(len(attr))
-                words.extend(attr)
-            elif isinstance(attr, list):
+            elif isinstance(attr, (tuple, list)):
                 words.append(len(attr))
                 words.extend(attr)
             # for convenience

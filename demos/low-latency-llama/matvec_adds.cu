@@ -10,7 +10,7 @@ using namespace megakernel;
 template <int _EXPECTED_ARRIVAL_COUNT, auto WeightsPtr,
           auto InputActivationsPtr, auto OutputActivationsPtr, int _opcode,
           int _prev_opcode = 0,
-          typename Config = default_config,
+          typename Config = config,
           typename Globals = llama_1b_globals>
 
 struct MatVecAddOp {
@@ -125,13 +125,13 @@ struct MatVecAddOp {
                 int activation_page = pipeline::get_activation_page(s);
                 s.wait_page_ready(activation_page);
 
-                s.record(megakernel::TEVENT_AT_GMEM_WAIT);
+                s.consumer_record(WAIT_EVENT);
                 while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1,
                                                 inst.reduction_block_idx}] <
                        EXPECTED_ARRIVAL_COUNT) {
                     __nanosleep(Config::GMEM_SPIN_LOOP_SLEEP_NANOS);
                 }
-                s.record(megakernel::TEVENT_DONE_GMEM_WAIT);
+                s.consumer_record(READY_EVENT);
 
                 auto &activations = pipeline::get_activations(s);
                 auto &InputActivations =
@@ -163,7 +163,7 @@ struct MatVecAddOp {
             kittens::warp::sync();
 
             if (kittens::laneid() == 0) {
-                s.record(megakernel::TEVENT_AT_GMEM_STORE);
+                s.storer_record(STORE_EVENT);
                 parsed_instruction inst{s};
 
                 kittens::tma::store_async_wait(); // not just read wait! full wait! must
@@ -171,8 +171,8 @@ struct MatVecAddOp {
 
                 // asm volatile("fence.acq_rel.gpu;\n"); // possible we need sc
                 // here but I don't think so.
+                s.storer_record(STORE2_EVENT);
                 atomicAdd(&g.Bar[{inst.layer, opcode - 1, 0}], inst.iters);
-                s.record(megakernel::TEVENT_DONE_GMEM_STORE);
             }
         }
     };

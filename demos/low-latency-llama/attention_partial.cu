@@ -307,7 +307,7 @@ template <typename config, typename globals> struct attention_partial {
     struct launcher {
         static __device__ void wait_for_kv(const globals &g, megakernel::state<config> &s,
                                            parsed_instruction &inst) {
-            s.record(megakernel::TEVENT_AT_GMEM_WAIT);
+            s.launcher_record(WAIT_EVENT);
 
             // Wait for the previous ops to finish (16 dims each, so 4 ops on
             // the same head)
@@ -325,7 +325,7 @@ template <typename config, typename globals> struct attention_partial {
                 __nanosleep(config::GMEM_SPIN_LOOP_SLEEP_NANOS);
             }
 
-            s.record(megakernel::TEVENT_DONE_GMEM_WAIT);
+            s.launcher_record(READY_EVENT);
         }
 
         static __device__ void run(const globals &g, megakernel::state<config> &s) {
@@ -554,7 +554,7 @@ template <typename config, typename globals> struct attention_partial {
 
             if (kittens::laneid() == 0) {
                 kittens::wait(O_arrived(s), 0);
-                s.record(megakernel::TEVENT_OUTPUT_READY);
+                s.storer_record(STORE_EVENT);
             }
             kittens::warp::sync();
 
@@ -587,7 +587,7 @@ template <typename config, typename globals> struct attention_partial {
             if (laneid == 0) {
                 o_sv(&O_smem)[GQA_RATIO] = get_O_smem(s);
                 kittens::wait(O_arrived(s), 0);
-                s.record(megakernel::TEVENT_OUTPUT_READY);
+                s.storer_record(STORE_EVENT);
 
                 for (int head_offset = 0; head_offset < GQA_RATIO;
                      head_offset++) {
@@ -641,17 +641,18 @@ template <typename config, typename globals> struct attention_partial {
             kittens::warp::sync(); // ensure all writes are committed
             // asm volatile("fence.acq_rel.gpu;");
 
-            kittens::tma::store_async_wait();
+            kittens::tma::store_async_read_wait();
             if (laneid == 0) {
-                s.record(123 + laneid);
+                s.storer_record(READY_EVENT);
                 finish_QOL_page(s);
             }
+            kittens::tma::store_async_wait();
 
             // Wait and finish
             if (laneid < GQA_RATIO) {
 
                 if (laneid == 0) {
-                    s.record(megakernel::TEVENT_AT_GMEM_STORE);
+                    s.storer_record(STORE2_EVENT);
                 }
 
                 if (skip_attn_reduction) {
@@ -664,10 +665,6 @@ template <typename config, typename globals> struct attention_partial {
                     atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1,
                                       q_head_start_idx + laneid}],
                               1);
-                }
-
-                if (laneid == 0) {
-                    s.record(megakernel::TEVENT_DONE_GMEM_STORE);
                 }
             }
         }

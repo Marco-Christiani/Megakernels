@@ -13,8 +13,8 @@
 namespace megakernel {
 
 template <typename config, typename globals, typename... ops>
-__device__ inline void mk_internal(const globals &g) {
-    uint64_t start_time = (uint64_t)clock64();
+__device__ __forceinline__ void mk_internal(const globals &g) {
+    uint64_t start_time = timestamp();
 #ifdef MK_DEBUG
     if (threadIdx.x == 0)
         printf("Thread %d: Kernel launched\n", threadIdx.x);
@@ -27,6 +27,7 @@ __device__ inline void mk_internal(const globals &g) {
                      [config::INSTRUCTION_PIPELINE_STAGES_BITS],
         instruction_arrived[config::INSTRUCTION_PIPELINE_STAGES],
         instruction_finished[config::INSTRUCTION_PIPELINE_STAGES],
+        instruction_fetch_ready,
 #ifdef KITTENS_BLACKWELL
         tensor_finished,
 #endif
@@ -51,14 +52,15 @@ __device__ inline void mk_internal(const globals &g) {
                       instruction_finished,
                       0,
                       0,
-                      {/* ... */},
+                      instruction_fetch_ready,
                       pages,
                       page_finished,
 #ifdef KITTENS_BLACKWELL
                       tensor_finished,
 #endif
                       semaphores_ready,
-                      start_time
+                      start_time,
+                      0 // write_event
 #ifdef KITTENS_BLACKWELL
                       ,
                       tensor_alloc
@@ -79,6 +81,7 @@ __device__ inline void mk_internal(const globals &g) {
         }
     }
 
+    if(threadIdx.x == 0) init_semaphore(instruction_fetch_ready, config::NUM_CONSUMER_WARPS);
     if (threadIdx.x < config::INSTRUCTION_PIPELINE_STAGES) {
         init_semaphore(instruction_arrived[threadIdx.x], 1);
         init_semaphore(instruction_finished[threadIdx.x],
@@ -158,16 +161,27 @@ __device__ inline void mk_internal(const globals &g) {
 // Forward a NoOp to the VM, to ensure that the VM can support zeros.
 template <typename config, typename globals, typename... ops>
 struct megakernel_wrapper {
-    __device__ inline static void run(const globals &g) {
+    __device__ __forceinline__ static void run(const globals &g) {
         mk_internal<config, globals, NoOp<config>, ops...>(g);
     }
 };
 
+#ifdef CUTLASS_NAME
+// Add the name "cutlass" to the kernel so that ptxas compiles it to run faster. (No, I'm not kidding.)
 template <typename config, typename globals, typename... ops>
 __launch_bounds__(config::NUM_THREADS, 1)
-    __cluster_dims__(config::CLUSTER_BLOCKS) __global__
-    void mk(const __grid_constant__ globals g) {
+__cluster_dims__(config::CLUSTER_BLOCKS)
+__global__ void cutlass_mk(const __grid_constant__ globals g) {
     megakernel_wrapper<config, globals, ops...>::run(g);
 }
+#define mk cutlass_mk
+#else
+template <typename config, typename globals, typename... ops>
+__launch_bounds__(config::NUM_THREADS, 1)
+__cluster_dims__(config::CLUSTER_BLOCKS)
+__global__ void mk(const __grid_constant__ globals g) {
+    megakernel_wrapper<config, globals, ops...>::run(g);
+}
+#endif
 
 } // namespace megakernel

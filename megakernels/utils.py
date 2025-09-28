@@ -1,17 +1,26 @@
 import json
+import math
 from pathlib import Path
 from typing import List
 
 import torch
-from megakernels.model_types import DeviceType
 from safetensors import safe_open
 from torch import Tensor
 from tqdm import tqdm
+
+from megakernels.model_types import DeviceType
 
 
 def assert_div(a, b):
     assert a % b == 0, f"{a} is not divisible by {b}"
     return a // b
+
+
+def ceil_div(a, b, alignment=1):
+    # First do ceiling division of a/b
+    result = (a + b - 1) // b
+    # Round up to next multiple of alignment
+    return ((result + alignment - 1) // alignment) * alignment
 
 
 def compute_shard_bounds(
@@ -104,6 +113,6 @@ def trepr(t: Tensor):
     return f"shape={t.shape}, sum={t.sum()}, vals={t}"
 
 
-def get_sm_count(device: str) -> int:
+def get_sm_count(device: torch.device | str) -> int:
     device_props = torch.cuda.get_device_properties(device)
     return device_props.multi_processor_count

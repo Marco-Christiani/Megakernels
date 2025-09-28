@@ -7,7 +7,6 @@ from megakernels.model_types import BatchState
 from megakernels.python_vm import PyVM_Interpreter
 from megakernels.scheduler import Schedule
 
-
 class Generator:
     def generate(
         self,
@@ -71,25 +70,45 @@ class PyTorchGenerator(Generator):
         prompt_len: int,
         ntok: int,
         ntok_already_generated: int = 1,
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ):
         bs = output_tokens.shape[0]
         starting_seq_len = prompt_len + ntok_already_generated
-        start_position_ids = torch.ones(
-            bs, 1, dtype=torch.long, device=self.model.device
-        ) * (starting_seq_len - 1)
+        if tp_size > 1: 
+            local_bs  = (bs + tp_size - 1) // tp_size
+            start = tp_rank * local_bs
+            end = min(start + local_bs, bs)
+            tokens_local = output_tokens[start:end]
+            start_position_ids = torch.ones(
+                local_bs, 1, dtype=torch.long, device=self.model.device
+            ) * (starting_seq_len - 1)
+        else:
+            start_position_ids = torch.ones(
+                bs, 1, dtype=torch.long, device=self.model.device
+            ) * (starting_seq_len - 1)
 
         for i in range(ntok):
             position_ids = start_position_ids + i
             input_token_pos = i + ntok_already_generated - 1
-            decode_inp = BatchState(
-                input_ids=output_tokens[:, input_token_pos : input_token_pos + 1],
-                position_ids=position_ids,
-                seq_len=starting_seq_len + i + 1,
-            )
+
+            if tp_size > 1:
+                decode_inp = BatchState(
+                    input_ids=tokens_local[:, input_token_pos : input_token_pos + 1],
+                    position_ids=position_ids,
+                    seq_len=starting_seq_len + i + 1,
+                )
+            else:
+                decode_inp = BatchState(
+                    input_ids=output_tokens[:, input_token_pos : input_token_pos + 1],
+                    position_ids=position_ids,
+                    seq_len=starting_seq_len + i + 1,
+                )
             decode_output: BatchState = self.model(decode_inp)
+            new_tok = decode_output.output_ids.squeeze(-1)
             assert decode_output.output_ids is not None
             output_pos = input_token_pos + 1
-            output_tokens[:, output_pos] = decode_output.output_ids.squeeze(-1)
+            output_tokens[:, output_pos] = new_tok 
 
 
 class MK_Generator(Generator):
@@ -148,15 +167,28 @@ class MK_Generator(Generator):
         prompt_len: int,
         ntok: int,
         ntok_already_generated: int = 1,
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ):
         """
         Return num tokens until stop seq, and total num tokens generated
         """
+
+        bs = output_tokens.size(0)
+        if tp_size > 1:
+            local_bs  = (bs + tp_size - 1) // tp_size   # ceil-divide
+            start     = tp_rank * local_bs
+            end       = min(start + local_bs, bs)
+            tokens_local = output_tokens[start:end]            # view, no copy
+        else:                                                  # single-GPU path
+            tokens_local = output_tokens
+            local_bs     = bs
+
         for i in range(ntok):
             input_token_pos = ntok_already_generated + i - 1
             output_token_pos = input_token_pos + 1
 
-            input_ids = output_tokens[:, input_token_pos : input_token_pos + 1]
+            input_ids = tokens_local[:, input_token_pos : input_token_pos + 1]
 
             pos_id = prompt_len + ntok_already_generated + i - 1
             output_ids = self.run(input_ids, pos_id=pos_id)
@@ -173,7 +205,6 @@ class PyVM_Generator(MK_Generator):
         self.model = model
         self.interpreter = interpreter
         self.schedule = schedule
-
         self.instructions = self.schedule.get_linear_instructions()
 
     def run(self, input_ids: Tensor, pos_id: int):
@@ -184,7 +215,8 @@ class PyVM_Generator(MK_Generator):
         post_embedding: BatchState = self.model.model.embed_tokens(batch_state)
         hiddens = post_embedding.hidden_states
         assert hiddens is not None
-        self.schedule.globs.hidden_states[:] = hiddens
+
+        self.schedule.globs.hidden_states = hiddens.squeeze()
         self.schedule.globs.barriers.zero_()
         self.schedule.globs.pos_id = pos_id
 

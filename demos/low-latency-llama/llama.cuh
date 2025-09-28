@@ -25,40 +25,61 @@
 #define H100_SM_COUNT 132
 #define B200_SM_COUNT 148
 
-constexpr int ATOMIC_ADD_START = megakernel::FREE_SLOTS_START;
-constexpr int ATOMIC_ADD_END = ATOMIC_ADD_START + 1;
-constexpr int EPILOGUE_START = ATOMIC_ADD_END + 1;
-constexpr int ACT_WAIT_DONE = EPILOGUE_START + 2;
-constexpr int WEIGHT_WAIT_START = ACT_WAIT_DONE + 3;
-constexpr int WEIGHT_WAIT_DONE = WEIGHT_WAIT_START + 4;
-constexpr int RMS_START = WEIGHT_WAIT_DONE + 4;
-constexpr int RMS_SCALE_WAIT_START = RMS_START + 1;
-constexpr int RMS_SCALE_WAIT_DONE = RMS_SCALE_WAIT_START + 1;
-constexpr int RMS_DONE = RMS_SCALE_WAIT_DONE + 1;
+struct config {
+    // Instruction pipeline
+    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2;
 
-constexpr int TEMP1 = RMS_DONE + 1;
-constexpr int TEMP2 = TEMP1 + 1;
-constexpr int TEMP3 = TEMP2 + 1;
-constexpr int TEMP4 = TEMP3 + 1;
-constexpr int TEMP5 = TEMP4 + 1;
-constexpr int TEMP6 = TEMP5 + 1;
+    // num bits required to represent num pipeline stages
+    static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
 
-using config = megakernel::default_config;
+    static constexpr int INSTRUCTION_WIDTH = 32; // 128 bytes per instruction.
+    using instruction_t = int[INSTRUCTION_WIDTH];
+
+    // Timing info
+    static constexpr int TIMING_WIDTH = 128;
+    using timing_t = int[TIMING_WIDTH];
+
+    // How many semaphores are available for dynamic use?
+    static constexpr int DYNAMIC_SEMAPHORES = 32;
+
+    // Scheduling approach -- explicit SM scheduling or work stealing?
+    static constexpr bool ENABLE_GLOBAL_WORK_QUEUE = false;
+    static constexpr int  GLOBAL_WORK_QUEUE_PARTITIONS = 1; // Only used if ENABLE_GLOBAL_WORK_QUEUE is true, can help minimize overhead.
+
+    // One controller warp, one load warp, one store warp, and one mma warp.
+    static constexpr int NUM_CONSUMER_WARPS = 16;
+    static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;
+    static constexpr int NUM_BLOCKS = 1;
+    static constexpr int CLUSTER_BLOCKS = 1;
+    static constexpr int MAX_SHARED_MEMORY = ::kittens::MAX_SHARED_MEMORY;
+
+    // Shared memory declared statically
+    static constexpr int SCRATCH_BYTES = 4096;
+    static constexpr int STATIC_SHARED_MEMORY =
+        512 + INSTRUCTION_PIPELINE_STAGES *
+                  (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 +
+                   DYNAMIC_SEMAPHORES * 8);
+    static constexpr int DYNAMIC_SHARED_MEMORY =
+        ::kittens::MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
+
+    // Shared memory declared dynamically
+    static constexpr int PAGE_SIZE = 16384;
+    static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
+    static_assert(NUM_PAGES == 13, "NUM_PAGES must be 13");
+
+    static constexpr bool TIMING_RECORD_ENABLED = true;
+
+    static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
+
+    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int NON_CONSUMER_REGISTERS = 64;
+};
 
 template <int _num_layers, int _hidden_dim, int _intermediate_dim,
           int _head_dim, int _num_attention_heads, int _num_kv_heads,
           int _kv_block_size, int _matvec_block_size, int _sm_count>
 struct globals_t {
-
-    // constexpr static unsigned int num_layers = _num_layers;
-    // constexpr static unsigned int matvec_block_size = _matvec_block_size;
-    // constexpr static unsigned int kv_block_size = _kv_block_size;
-    // constexpr static unsigned int head_dim = _head_dim;
-    // constexpr static unsigned int hidden_dim = _hidden_dim;
-    // constexpr static unsigned int intermediate_dim = _intermediate_dim;
-    // constexpr static unsigned int num_attention_heads = _num_attention_heads;
-    // constexpr static unsigned int num_kv_heads = _num_kv_heads;
-    // constexpr static unsigned int sm_count = _sm_count;
 
     constexpr static int num_layers = _num_layers;
     constexpr static int matvec_block_size = _matvec_block_size;

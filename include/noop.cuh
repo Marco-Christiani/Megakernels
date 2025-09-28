@@ -29,6 +29,8 @@ template <typename config> struct NoOp {
                 s.wait_page_ready(pid);
                 s.finish_page(pid, config::NUM_CONSUMER_WARPS);
             }
+
+            kittens::warp::arrive(s.instruction_fetch_ready, config::NUM_CONSUMER_WARPS);
         }
     };
     struct launcher { // launches mma's

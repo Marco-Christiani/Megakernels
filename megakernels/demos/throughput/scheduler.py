@@ -37,8 +37,9 @@ def make_globals(
     extra_config = model.extra_config
     bs = extra_config.max_batch_size
 
+    # TODO: should be 256 x 256 for blackwell
     matmul_batch_block_size = 128
-    matmul_output_block_size = 128
+    matmul_output_block_size = 256
     norm_block_size = 16
 
     barriers = torch.zeros(
@@ -59,8 +60,8 @@ def make_globals(
         # model params
         qkv_proj_weights=stacked_params.qkv_proj,
         o_proj_weights=stacked_params.o_proj,
-        attn_ln_weights=stacked_params.attn_ln_weight,
-        mlp_ln_weights=stacked_params.mlp_ln_weight,
+        attn_ln_weights=stacked_params.attn_norm_weight,
+        mlp_ln_weights=stacked_params.mlp_norm_weight,
         up_proj_weights=stacked_params.up_proj,
         gate_proj_weights=stacked_params.gate_proj,
         down_proj_weights=stacked_params.down_proj,
@@ -104,10 +105,29 @@ def schedule_pre_attn_norm(
     globs: Globals,
     layer_idx: int,
 ) -> tuple[list[Instruction], bool]:  # Returns instructions and a flag to stop
-    instructions: list[Instruction] = []
+    sm_count = globs.sm_count()
+
+    round_robin_queues = [[] for _ in range(sm_count)]
 
     for bidx in range(0, globs.batch_size):
-        instructions.append(PreAttnLayerNorm(layer_idx=layer_idx, batch_start_idx=bidx))
+        sm_idx = bidx % sm_count
+        round_robin_queues[sm_idx].append(bidx)
+
+    instructions: list[Instruction] = []
+    max_vecs_per_inst = min(6 * 32768 // (globs.hidden_size * 2), 12)
+
+    for sm_idx in range(sm_count):
+        queue = round_robin_queues[sm_idx]
+        queue_size = len(queue)
+
+        for start_idx in range(0, queue_size, max_vecs_per_inst):
+            end_idx = min(start_idx + max_vecs_per_inst, queue_size)
+
+            batch_indices = queue[start_idx:end_idx]
+
+            instructions.append(
+                PreAttnLayerNorm(layer_idx=layer_idx, batch_indices=batch_indices)
+            )
 
     return instructions
 
