@@ -1,0 +1,26 @@
+# export VIRTUAL_ENV=""
+# use python ""
+# source "/bin/activate"
+export HF_TOKEN=
+export THUNDERKITTENS_ROOT=
+export MEGAKERNELS_ROOT=
+
+# metadata / project parameters
+export PYTHON_VERSION="3.12"
+export GPU="H100"
+export UV_LINK_MODE="copy"
+
+if [ -d /usr/local/cuda ]; then
+  export CUDA_HOME="/usr/lib/cuda"
+elif [ -d /usr/local/cuda-12.8 ]; then
+  export CUDA_HOME="/usr/local/cuda-12.8"
+elif [ -d /usr/local/cuda-12.6 ]; then
+  export CUDA_HOME="/usr/local/cuda-12.6"
+else
+  export CUDA_HOME=""
+fi
+
+# if [ -n "$CUDA_HOME" ]; then
+#   PATH_add "/bin"
+#   export LD_LIBRARY_PATH="/lib64:/usr/mpi/gcc/openmpi-4.1.7rc1/lib:/usr/mpi/gcc/openmpi-4.1.7rc1/lib64"
+# fi
