@@ -10,12 +10,14 @@
 #include <iostream>
 #include <vector>
 
-namespace py = pybind11;
-using namespace kittens;
-
 constexpr int IN_DIM = 128;
 constexpr int OUT_DIM = 64;
+// temporary
 constexpr int BLOCK = 16;
+// moving to this soon
+// constexpr int ROW_TILE = 16;
+// constexpr int COL_TILE = 32;
+
 
 using config = linear_training_mk_demo_config;
 using state_t = megakernel::state<config>;
@@ -59,8 +61,9 @@ template <typename C = config> struct LinearFwd {
 
     struct loader {
         static __device__ void run(const linear_training_globals &, state_t &s) {
-            if (laneid() >= 1 && laneid() < C::NUM_PAGES) {
-                int pid = s.pid(laneid());
+            const int lane = kittens::laneid();
+            if (lane >= 1 && lane < C::NUM_PAGES) {
+                int pid = s.pid(lane);
                 s.wait_page_ready(pid);
                 s.finish_page(pid, C::NUM_CONSUMER_WARPS);
             }
@@ -70,7 +73,7 @@ template <typename C = config> struct LinearFwd {
     struct launcher {
         static __device__ void run(const linear_training_globals &, state_t &s) {
 #ifdef KITTENS_BLACKWELL
-            if (laneid() == 0) {
+            if (kittens::laneid() == 0) {
                 s.wait_tensor_ready();
                 arrive(s.tensor_finished, C::NUM_CONSUMER_WARPS);
             }
@@ -82,17 +85,19 @@ template <typename C = config> struct LinearFwd {
 
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            auto &inst = s.instruction();
-            int out_block = inst[2];
-            int in_block = inst[3];
+            const auto &inst = s.instruction();
+            const int out_block = inst[2];
+            const int in_block = inst[3];
+            const int wid = kittens::warpid();
+            const int lane = kittens::laneid();
 
-            if (g.debug_vis && laneid() == 0 && s.instruction_index == 0 && kittens::warpid() == 0) {
+            if (g.debug_vis && lane == 0 && s.instruction_index == 0 && wid == 0) {
                 printf("[linear-training-mk-demo] worker_id=%u opcode=%d instruction_rows=%d\n",
                        (unsigned)megakernel::get_worker_id(), inst[0], (int)g.instructions.rows());
             }
-
-            if (kittens::warpid() == 0 && laneid() == 0) {
+            if (wid == 0 && lane == 0) {
                 for (int b = 0; b < g.batch_size; b++) {
+                    // row = out_block*ROW_TILE + wid
                     float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
                     float *in_tile = g.input.raw_ptr + b * IN_DIM + in_block * BLOCK;
                     for (int o = 0; o < BLOCK; o++) {
@@ -122,8 +127,9 @@ template <typename C = config> struct LossGrad {
 
     struct loader {
         static __device__ void run(const linear_training_globals &, state_t &s) {
-            if (laneid() >= 1 && laneid() < C::NUM_PAGES) {
-                int pid = s.pid(laneid());
+            const int lane = kittens::laneid();
+            if (lane >= 1 && lane < C::NUM_PAGES) {
+                int pid = s.pid(lane);
                 s.wait_page_ready(pid);
                 s.finish_page(pid, C::NUM_CONSUMER_WARPS);
             }
@@ -133,7 +139,7 @@ template <typename C = config> struct LossGrad {
     struct launcher {
         static __device__ void run(const linear_training_globals &, state_t &s) {
 #ifdef KITTENS_BLACKWELL
-            if (laneid() == 0) {
+            if (kittens::laneid() == 0) {
                 s.wait_tensor_ready();
                 arrive(s.tensor_finished, C::NUM_CONSUMER_WARPS);
             }
@@ -145,11 +151,13 @@ template <typename C = config> struct LossGrad {
 
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            auto &inst = s.instruction();
-            int out_block = inst[2];
-            float scale = 2.0f / static_cast<float>(g.batch_size);
+            const auto &inst = s.instruction();
+            const int out_block = inst[2];
+            const int wid = kittens::warpid();
+            const int lane = kittens::laneid();
+            const float scale = 2.0f / static_cast<float>(g.batch_size);
 
-            if (kittens::warpid() == 0 && laneid() == 0) {
+            if (wid == 0 && lane == 0) {
                 for (int b = 0; b < g.batch_size; b++) {
                     float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
                     float *tgt_tile = g.target.raw_ptr + b * OUT_DIM + out_block * BLOCK;
@@ -175,8 +183,9 @@ template <typename C = config> struct LinearBwdWeight {
 
     struct loader {
         static __device__ void run(const linear_training_globals &, state_t &s) {
-            if (laneid() >= 1 && laneid() < C::NUM_PAGES) {
-                int pid = s.pid(laneid());
+            const int lane = kittens::laneid();
+            if (lane >= 1 && lane < C::NUM_PAGES) {
+                int pid = s.pid(lane);
                 s.wait_page_ready(pid);
                 s.finish_page(pid, C::NUM_CONSUMER_WARPS);
             }
@@ -186,7 +195,7 @@ template <typename C = config> struct LinearBwdWeight {
     struct launcher {
         static __device__ void run(const linear_training_globals &, state_t &s) {
 #ifdef KITTENS_BLACKWELL
-            if (laneid() == 0) {
+            if (kittens::laneid() == 0) {
                 s.wait_tensor_ready();
                 arrive(s.tensor_finished, C::NUM_CONSUMER_WARPS);
             }
@@ -198,12 +207,14 @@ template <typename C = config> struct LinearBwdWeight {
 
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            auto &inst = s.instruction();
-            int out_block = inst[2];
-            int in_block = inst[3];
-            float inv_batch = 1.0f / static_cast<float>(g.batch_size);
+            const auto &inst = s.instruction();
+            const int out_block = inst[2];
+            const int in_block = inst[3];
+            const int wid = kittens::warpid();
+            const int lane = kittens::laneid();
+            const float inv_batch = 1.0f / static_cast<float>(g.batch_size);
 
-            if (kittens::warpid() == 0 && laneid() == 0) {
+            if (wid == 0 && lane == 0) {
                 for (int o = 0; o < BLOCK; o++) {
                     int out_row = out_block * BLOCK + o;
                     float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
@@ -234,8 +245,9 @@ template <typename C = config> struct SgdUpdate {
 
     struct loader {
         static __device__ void run(const linear_training_globals &, state_t &s) {
-            if (laneid() >= 1 && laneid() < C::NUM_PAGES) {
-                int pid = s.pid(laneid());
+            const int lane = kittens::laneid();
+            if (lane >= 1 && lane < C::NUM_PAGES) {
+                int pid = s.pid(lane);
                 s.wait_page_ready(pid);
                 s.finish_page(pid, C::NUM_CONSUMER_WARPS);
             }
@@ -245,7 +257,7 @@ template <typename C = config> struct SgdUpdate {
     struct launcher {
         static __device__ void run(const linear_training_globals &, state_t &s) {
 #ifdef KITTENS_BLACKWELL
-            if (laneid() == 0) {
+            if (kittens::laneid() == 0) {
                 s.wait_tensor_ready();
                 arrive(s.tensor_finished, C::NUM_CONSUMER_WARPS);
             }
@@ -257,11 +269,13 @@ template <typename C = config> struct SgdUpdate {
 
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            auto &inst = s.instruction();
-            int out_block = inst[2];
-            int in_block = inst[3];
+            const auto &inst = s.instruction();
+            const int out_block = inst[2];
+            const int in_block = inst[3];
+            const int wid = kittens::warpid();
+            const int lane = kittens::laneid();
 
-            if (kittens::warpid() == 0 && laneid() == 0) {
+            if (wid == 0 && lane == 0) {
                 for (int o = 0; o < BLOCK; o++) {
                     int out_row = out_block * BLOCK + o;
                     float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
@@ -402,10 +416,10 @@ PYBIND11_MODULE(linear_training_mk_demo, m) {
         "run",
         &run_linear_training,
         "Run linear training megakernel",
-        py::arg("instructions"),
-        py::arg("input"),
-        py::arg("target"),
-        py::arg("weights"),
-        py::arg("lr"),
-        py::arg("debug") = false);
+        pybind11::arg("instructions"),
+        pybind11::arg("input"),
+        pybind11::arg("target"),
+        pybind11::arg("weights"),
+        pybind11::arg("lr"),
+        pybind11::arg("debug") = false);
 }

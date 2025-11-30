@@ -7,9 +7,13 @@ import linear_training_mk_demo
 
 IN_DIM = 128
 OUT_DIM = 64
-BLOCK = 16
-IN_BLOCKS = IN_DIM // BLOCK
-OUT_BLOCKS = OUT_DIM // BLOCK
+
+ROW_TILE = 16
+# COL_TILE = 32
+COL_TILE = 16
+
+COL_BLOCKS = IN_DIM // COL_TILE
+ROW_BLOCKS = OUT_DIM // ROW_TILE
 
 
 class OpCodes(IntEnum):
@@ -27,34 +31,34 @@ def env_flag(name: str, default: str = "0") -> bool:
 def _build_single_queue(device: torch.device) -> torch.Tensor:
     insts: list[list[int]] = []
 
-    for out_block in range(OUT_BLOCKS):
-        for in_block in range(IN_BLOCKS):
+    for row_block in range(ROW_BLOCKS):
+        for col_block in range(COL_BLOCKS):
             row = [0] * 32
             row[0] = OpCodes.LINEAR_FWD.value
-            row[2] = out_block
-            row[3] = in_block
+            row[2] = row_block
+            row[3] = col_block
             insts.append(row)
 
-    for out_block in range(OUT_BLOCKS):
+    for row_block in range(ROW_BLOCKS):
         row = [0] * 32
         row[0] = OpCodes.LOSS_GRAD.value
-        row[2] = out_block
+        row[2] = row_block
         insts.append(row)
 
-    for out_block in range(OUT_BLOCKS):
-        for in_block in range(IN_BLOCKS):
+    for row_block in range(ROW_BLOCKS):
+        for col_block in range(COL_BLOCKS):
             row = [0] * 32
             row[0] = OpCodes.LINEAR_BWD_WEIGHT.value
-            row[2] = out_block
-            row[3] = in_block
+            row[2] = row_block
+            row[3] = col_block
             insts.append(row)
 
-    for out_block in range(OUT_BLOCKS):
-        for in_block in range(IN_BLOCKS):
+    for row_block in range(ROW_BLOCKS):
+        for col_block in range(COL_BLOCKS):
             row = [0] * 32
             row[0] = OpCodes.SGD_UPDATE.value
-            row[2] = out_block
-            row[3] = in_block
+            row[2] = row_block
+            row[3] = col_block
             insts.append(row)
 
     return torch.tensor(insts, device=device, dtype=torch.int32)

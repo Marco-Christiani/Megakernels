@@ -9,3 +9,6 @@ __pycache__/
 *.ptx
 *.cubin
 *.fatbin
+.trash*
+*.bak
+.envrc
