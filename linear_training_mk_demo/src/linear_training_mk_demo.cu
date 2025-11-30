@@ -24,60 +24,76 @@ using state_t = megakernel::state<config>;
 template <typename Config, typename Globals>
 struct linear_fwd_pipeline {
     using state_t = megakernel::state<Config>;
+    using tile_t = kittens::st_fl<ROW_TILE, COL_TILE>;
 
-    // Single logical page reserved for weights.
+    // Two logical pages reserved for this op: weights + activations.
     static constexpr int WEIGHTS_LID = 0;
+    static constexpr int ACTIV_LID   = 1;
     static constexpr int SEM_WEIGHTS_READY = 0;
-    static constexpr int SEM_COUNT = 1;
+    static constexpr int SEM_ACTIV_READY   = 1;
+    static constexpr int SEM_COUNT = 2;
 
     __device__ static int weights_pid(state_t &s) {
         return s.pid(WEIGHTS_LID);
+    }
+    __device__ static int activ_pid(state_t &s) {
+        return s.pid(ACTIV_LID);
+    }
+
+    __device__ static tile_t &weights_tile(state_t &s) {
+        // Use the VM page as backing storage for the tile.
+        return *reinterpret_cast<tile_t *>(s.pages[weights_pid(s)].ptr());
+    }
+    __device__ static tile_t &activ_tile(state_t &s) {
+        return *reinterpret_cast<tile_t *>(s.pages[activ_pid(s)].ptr());
     }
 
     __device__ static kittens::semaphore &weights_ready(state_t &s) {
         return s.semaphores()[SEM_WEIGHTS_READY];
     }
-
-    __device__ static kittens::st_fl<ROW_TILE, COL_TILE> &weights_tile(state_t &s) {
-        // Use the VM page as backing storage for the tile.
-        return *reinterpret_cast<kittens::st_fl<ROW_TILE, COL_TILE> *>(
-            s.pages[weights_pid(s)].ptr()
-        );
+    __device__ static kittens::semaphore &activ_ready(state_t &s) {
+        return s.semaphores()[SEM_ACTIV_READY];
     }
 
     static __device__ int init_semaphores(state_t &s) {
         if (kittens::laneid() == 0) {
             kittens::init_semaphore(weights_ready(s), 1);
+            kittens::init_semaphore(activ_ready(s), 1);
         }
         return SEM_COUNT;
     }
 
-    // Loader:
-    //  - wait for the weights page
-    //  - fill the 16x32 tile
-    //  - signal consumers via a single semaphore (parity fixed at 0)
+    // Loader waits for both logical pages, fills each tile, then signals
+    // the matching semaphores (always at parity 0).
     static __device__ void loader_fill(state_t &s, const Globals &g) {
         const int lane = kittens::laneid();
         const auto &inst = s.instruction();
         const int row_block = inst[2];
         const int col_block = inst[3];
-        const int pid = weights_pid(s);
+        const int pid_w = weights_pid(s);
+        const int pid_a = activ_pid(s);
 
         if (lane == 0) {
-            printf("[linear-training loader] worker=%u inst=%d waiting for weights page pid=%d row_block=%d col_block=%d\n",
+            printf("[linear-training loader] worker=%u inst=%d waiting for weights pid=%d row_block=%d col_block=%d\n",
                    (unsigned)megakernel::get_worker_id(),
                    s.instruction_index,
-                   pid,
+                   pid_w,
                    row_block,
                    col_block);
+            printf("[linear-training loader] worker=%u inst=%d waiting for activ pid=%d\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   pid_a);
         }
 
-        s.wait_page_ready(pid);
+        s.wait_page_ready(pid_w);
+        s.wait_page_ready(pid_a);
         __syncwarp();
 
-        auto &tile = weights_tile(s);
+        auto &tile_w = weights_tile(s);
+        auto &tile_a = activ_tile(s);
 
-        // Fill the 16x32 tile from global weights.
+        // Fill the weights tile from global weights.
         for (int linear = lane; linear < ROW_TILE * COL_TILE; linear += kittens::WARP_THREADS) {
             int tile_row = linear / COL_TILE;
             int tile_col = linear % COL_TILE;
@@ -88,31 +104,56 @@ struct linear_fwd_pipeline {
             if (row < OUT_DIM && col < IN_DIM) {
                 val = g.weights[{0, 0, row, col}];
             }
-            tile[make_int2(tile_row, tile_col)] = val;
+            tile_w[make_int2(tile_row, tile_col)] = val;
         }
-        __syncwarp();  // ensure the tile is fully populated before consumers read it
+        __syncwarp();  // ensure the weights tile is ready
+
+        // Fill the activation tile with cached batch-0 activations.
+        for (int linear = lane; linear < ROW_TILE * COL_TILE; linear += kittens::WARP_THREADS) {
+            int tile_row = linear / COL_TILE;
+            int tile_col = linear % COL_TILE;
+            int col      = col_block * COL_TILE + tile_col;
+
+            float val = 0.f;
+            if (col < IN_DIM) {
+                val = g.input[{0, 0, 0, col}];
+            }
+            tile_a[make_int2(tile_row, tile_col)] = val;
+        }
+        __syncwarp();
 
         if (kittens::laneid() == 0) {
             kittens::arrive(weights_ready(s));
-            printf("[linear-training loader] worker=%u inst=%d arrived weights_ready pid=%d\n",
+            kittens::arrive(activ_ready(s));
+            printf("[linear-training loader] worker=%u inst=%d arrived weights_ready pid=%d and activ_ready pid=%d\n",
                    (unsigned)megakernel::get_worker_id(),
                    s.instruction_index,
-                   pid);
+                   pid_w,
+                   pid_a);
         }
     }
 
-    // Called once per warp after it finishes using the weights tile.
+    // Called once per warp after it finishes using the tiles.
     static __device__ void release_weights_page(state_t &s) {
-        const int lane = kittens::laneid();
-        if (lane == 0) {
-            // One arrival per warp. Config::NUM_CONSUMER_WARPS arrivals total.
-            int weights_pid_val = weights_pid(s);
-            s.warp_finish_page(weights_pid_val, 1);
+        if (kittens::laneid() == 0) {
+            int pid = weights_pid(s);
+            s.warp_finish_page(pid, 1);
             printf("[linear-training release] worker=%u inst=%d warp=%d released weights pid=%d\n",
                    (unsigned)megakernel::get_worker_id(),
                    s.instruction_index,
                    kittens::warpid(),
-                   weights_pid_val);
+                   pid);
+        }
+    }
+    static __device__ void release_activ_page(state_t &s) {
+        if (kittens::laneid() == 0) {
+            int pid = activ_pid(s);
+            s.warp_finish_page(pid, 1);
+            printf("[linear-training release] worker=%u inst=%d warp=%d released activ pid=%d\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   kittens::warpid(),
+                   pid);
         }
     }
 };
@@ -150,18 +191,19 @@ struct LinearFwd {
     static constexpr int opcode = 1;
     using pipeline = linear_fwd_pipeline<C, linear_training_globals>;
 
-    // Design note: this op uses a single logical page (WEIGHTS_LID) and a single
-    // dynamic semaphore (weights_ready, parity fixed at 0). The loader warp alone
-    // waits for the weights page, fills the shared tile, and arrives the semaphore.
-    // All NUM_CONSUMER_WARPS consumer warps wait on that semaphore before reading
-    // the tile and each calls warp_finish_page once, no block-wide syncs exist in
-    // the loader path, so only the participating warp ever stalls.
+    // Design note: this op manages two logical pages (weights + activations)
+    // and two single-parity semaphores. The loader warp waits for both pages,
+    // fills each tile, and arrives both semaphores, while every consumer waits on
+    // both before reading and contributes a warp_finish_page arrival for each
+    // page, synchronization remains warp-scoped in the loader path.
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &s) {
             return pipeline::init_semaphores(s);
         }
         static __device__ int release_lid(const linear_training_globals &, typename C::instruction_t &, int &query) {
-            // Simple round-robin logical ID assignment, as before.
+            // Lane 0 owns WEIGHTS_LID, lane 1 owns ACTIV_LID, others map round-robin.
+            if (query == 0) return pipeline::WEIGHTS_LID;
+            if (query == 1) return pipeline::ACTIV_LID;
             return query % C::NUM_PAGES;
         }
     };
@@ -217,18 +259,29 @@ struct LinearFwd {
             }
 
             kittens::wait(pipeline::weights_ready(s), 0);
+            kittens::wait(pipeline::activ_ready(s), 0);
             __syncwarp();
+            if (lane == 0) {
+                printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d observed weights and activ tiles ready (pids=%d/%d)\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       wid,
+                       pipeline::weights_pid(s),
+                       pipeline::activ_pid(s));
+            }
 
             auto &weights_tile = pipeline::weights_tile(s);
+            auto &activ_tile = pipeline::activ_tile(s);
 
             // Some warps may not correspond to a valid output row.
             const bool active = (row < OUT_DIM);
 
             if (active) {
                 float w_lane = weights_tile[make_int2(wid, lane)];
+                float activ_lane = activ_tile[make_int2(wid, lane)];
 
                 for (int b = 0; b < g.batch_size; ++b) {
-                    float x_val = g.input[{b, 0, 0, col}];
+                    float x_val = (b == 0) ? activ_lane : g.input[{b, 0, 0, col}];
                     float partial = x_val * w_lane;
 
                     float dot = partial;
@@ -244,6 +297,13 @@ struct LinearFwd {
                                wid,
                                b,
                                dot);
+                        if (b == 0) {
+                            printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d used cached activ lane value=%f\n",
+                                   (unsigned)megakernel::get_worker_id(),
+                                   s.instruction_index,
+                                   wid,
+                                   activ_lane);
+                        }
                         float old = (in_block == 0) ? 0.0f : g.output[{b, 0, 0, row}];
                         g.output[{b, 0, 0, row}] = old + dot;
                     }
@@ -252,6 +312,7 @@ struct LinearFwd {
 
             // Every warp must contribute to releasing the weights page.
             pipeline::release_weights_page(s);
+            pipeline::release_activ_page(s);
         }
     };
 };
