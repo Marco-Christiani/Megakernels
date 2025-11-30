@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.so
+*.a
+build/
+dist/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+__pycache__/
+*.pyc
+*.pyo
