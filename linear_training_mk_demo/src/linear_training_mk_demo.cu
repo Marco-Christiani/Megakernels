@@ -18,6 +18,8 @@ constexpr int ROW_TILE = 16;
 constexpr int COL_TILE = 32;
 
 using weights_tile_t = kittens::st_fl<ROW_TILE, COL_TILE>;
+using activ_vec_t = kittens::rv_fl<COL_TILE>;
+using out_vec_t = kittens::rv_fl<ROW_TILE>;
 
 using config = linear_training_mk_demo_config;
 using state_t = megakernel::state<config>;
@@ -273,22 +275,49 @@ struct LinearFwd {
             auto &weights_tile = pipeline::weights_tile(s);
             auto &activ_tile = pipeline::activ_tile(s);
 
-            // Some warps may not correspond to a valid output row.
+            using reg_tile_t = kittens::rt_fl<ROW_TILE, COL_TILE>;
+            using row_vec_t = typename reg_tile_t::row_vec;
+            using col_vec_t = typename reg_tile_t::col_vec;
+
+            reg_tile_t weights_reg;
+            reg_tile_t broadcast_tile;
+            row_vec_t row_activations;
+            col_vec_t sum_col_vec;
+            out_vec_t row_sum_vec;
+            activ_vec_t activ_vec;
+
+            kittens::warp::load(weights_reg, weights_tile);
+
             const bool active = (row < OUT_DIM);
+            const int col_base = COL_TILE * in_block;
 
             if (active) {
-                float w_lane = weights_tile[make_int2(wid, lane)];
-                float activ_lane = activ_tile[make_int2(wid, lane)];
-
                 for (int b = 0; b < g.batch_size; ++b) {
-                    float x_val = (b == 0) ? activ_lane : g.input[{b, 0, 0, col}];
-                    float partial = x_val * w_lane;
-
-                    float dot = partial;
-#pragma unroll
-                    for (int offset = 16; offset > 0; offset >>= 1) {
-                        dot += __shfl_down_sync(0xffffffff, dot, offset);
+                    kittens::warp::zero(activ_vec);
+                    if (lane < COL_TILE) {
+                        int col_idx = col_base + lane;
+                        float x_val = 0.0f;
+                        if (col_idx < IN_DIM) {
+                            x_val = (b == 0)
+                                        ? activ_tile[make_int2(wid, lane)]
+                                        : g.input[{b, 0, 0, col_idx}];
+                        }
+                        activ_vec[0][lane] = x_val;
                     }
+                    __syncwarp();
+
+                    kittens::warp::copy(row_activations, activ_vec);
+                    kittens::warp::broadcast_col(broadcast_tile, row_activations);
+                    kittens::warp::mul(broadcast_tile, broadcast_tile, weights_reg);
+                    kittens::warp::row_sum(sum_col_vec, broadcast_tile);
+                    kittens::warp::copy(row_sum_vec, sum_col_vec);
+
+                    float dot_lane = 0.f;
+                    if (lane < ROW_TILE) {
+                        float lane_val = row_sum_vec[0][0];
+                        dot_lane = (lane == wid) ? lane_val : 0.f;
+                    }
+                    float dot = __shfl_sync(0xffffffff, dot_lane, wid);
 
                     if (lane == 0) {
                         printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d batch=%d partial=%f\n",
@@ -297,13 +326,6 @@ struct LinearFwd {
                                wid,
                                b,
                                dot);
-                        if (b == 0) {
-                            printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d used cached activ lane value=%f\n",
-                                   (unsigned)megakernel::get_worker_id(),
-                                   s.instruction_index,
-                                   wid,
-                                   activ_lane);
-                        }
                         float old = (in_block == 0) ? 0.0f : g.output[{b, 0, 0, row}];
                         g.output[{b, 0, 0, row}] = old + dot;
                     }
