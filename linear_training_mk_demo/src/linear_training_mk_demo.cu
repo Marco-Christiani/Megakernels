@@ -12,11 +12,9 @@
 
 constexpr int IN_DIM = 128;
 constexpr int OUT_DIM = 64;
-// temporary
-constexpr int BLOCK = 16;
-// moving to this soon
-// constexpr int ROW_TILE = 16;
-// constexpr int COL_TILE = 32;
+
+constexpr int ROW_TILE = 16;
+constexpr int COL_TILE = 32;
 
 
 using config = linear_training_mk_demo_config;
@@ -25,12 +23,12 @@ using state_t = megakernel::state<config>;
 struct linear_training_globals {
     using instruction_layout = megakernel::instruction_layout<config>;
     using timing_layout = megakernel::timing_layout<config>;
-    using input_t = kittens::gl<float, 1, -1, 1, IN_DIM>;
-    using target_t = kittens::gl<float, 1, -1, 1, OUT_DIM>;
-    using output_t = kittens::gl<float, 1, -1, 1, OUT_DIM>;
-    using grad_out_t = kittens::gl<float, 1, -1, 1, OUT_DIM>;
-    using weights_t = kittens::gl<float, 1, OUT_DIM, 1, IN_DIM>;
-    using grad_w_t = kittens::gl<float, 1, OUT_DIM, 1, IN_DIM>;
+    using input_t = kittens::gl<float, -1, 1, 1, IN_DIM>;
+    using target_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
+    using output_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
+    using grad_out_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
+    using weights_t = kittens::gl<float, 1, 1, OUT_DIM, IN_DIM>;
+    using grad_w_t = kittens::gl<float, 1, 1, OUT_DIM, IN_DIM>;
 
     instruction_layout instructions;
     timing_layout timings;
@@ -84,31 +82,80 @@ template <typename C = config> struct LinearFwd {
     struct storer { static __device__ void run(const linear_training_globals &, state_t &) {} };
 
     struct consumer {
+        // LinearFwd -Naive 1 thread does the work
+        // static __device__ void run(const linear_training_globals &g, state_t &s) {
+        //     const auto &inst = s.instruction();
+        //     const int out_block = inst[2];
+        //     const int in_block = inst[3];
+        //     const int wid = kittens::warpid(); // row
+        //     const int lane = kittens::laneid(); // col
+
+        //     if (g.debug_vis && lane == 0 && s.instruction_index == 0 && wid == 0) {
+        //         printf("[linear-training-mk-demo] worker_id=%u opcode=%d instruction_rows=%d\n",
+        //                (unsigned)megakernel::get_worker_id(), inst[0], (int)g.instructions.rows());
+        //     }
+        //     for (int b = 0; b < g.batch_size; b++) {
+        //         const int row_global_offset = (b*OUT_DIM) + (ROW_TILE*out_block) + wid;
+        //         const int col_global_offset = (b*IN_DIM) + (COL_TILE*in_block) + lane;
+        //         g.input.operator[]
+
+        //         // old
+        //         // float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
+        //         // float *in_tile = g.input.raw_ptr + b * IN_DIM + in_block * BLOCK;
+        //         // for (int o = 0; o < BLOCK; o++) {
+        //         //     float acc = (in_block == 0) ? 0.f : out_tile[o];
+        //         //     int out_row = out_block * BLOCK + o;
+        //         //     float *w_row = g.weights.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
+        //         //     for (int k = 0; k < BLOCK; k++) {
+        //         //         acc += in_tile[k] * w_row[k];
+        //         //     }
+        //         //     out_tile[o] = acc;
+        //         // }
+        //     }
+        // }
+        // LinearFwd - 2D Tiled Version
         static __device__ void run(const linear_training_globals &g, state_t &s) {
             const auto &inst = s.instruction();
             const int out_block = inst[2];
-            const int in_block = inst[3];
-            const int wid = kittens::warpid();
+            const int in_block  = inst[3];
+
+            const int row  = ROW_TILE * out_block + kittens::warpid();   // output row index
+            const int col  = COL_TILE * in_block  + kittens::laneid();   // input col index
             const int lane = kittens::laneid();
 
-            if (g.debug_vis && lane == 0 && s.instruction_index == 0 && wid == 0) {
+            if (g.debug_vis && lane == 0 && s.instruction_index == 0 && kittens::warpid() == 0) {
                 printf("[linear-training-mk-demo] worker_id=%u opcode=%d instruction_rows=%d\n",
-                       (unsigned)megakernel::get_worker_id(), inst[0], (int)g.instructions.rows());
+                    (unsigned)megakernel::get_worker_id(), inst[0], (int)g.instructions.rows());
             }
-            if (wid == 0 && lane == 0) {
-                for (int b = 0; b < g.batch_size; b++) {
-                    // row = out_block*ROW_TILE + wid
-                    float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
-                    float *in_tile = g.input.raw_ptr + b * IN_DIM + in_block * BLOCK;
-                    for (int o = 0; o < BLOCK; o++) {
-                        float acc = (in_block == 0) ? 0.f : out_tile[o];
-                        int out_row = out_block * BLOCK + o;
-                        float *w_row = g.weights.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
-                        for (int k = 0; k < BLOCK; k++) {
-                            acc += in_tile[k] * w_row[k];
-                        }
-                        out_tile[o] = acc;
-                    }
+
+            // Guard in case dims are not exact multiples
+            if (row >= OUT_DIM || col >= IN_DIM) return;
+
+            // Loop over batch
+            for (int b = 0; b < g.batch_size; ++b) {
+                // using their operator overload from ThunderKittens/include/types/global/gl.cuh
+                // input[b, col]
+                float x_val = g.input[{b, 0, 0, col}];
+
+                // weights[row, col]
+                float w_val = g.weights[{0, 0, row, col}];
+
+                float partial = x_val * w_val;
+
+                // warp reduce across 32 lanes
+                float dot = partial;
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_down_sync(0xffffffff, dot, offset);
+                }
+
+                if (lane == 0) {
+                    // First input-block starts from 0, later blocks accumulate
+                    float old = (in_block == 0)
+                        ? 0.0f
+                        : g.output[{b, 0, 0, row}];
+
+                    g.output[{b, 0, 0, row}] = old + dot;
                 }
             }
         }
@@ -150,24 +197,43 @@ template <typename C = config> struct LossGrad {
     struct storer { static __device__ void run(const linear_training_globals &, state_t &) {} };
 
     struct consumer {
-        static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const auto &inst = s.instruction();
-            const int out_block = inst[2];
-            const int wid = kittens::warpid();
-            const int lane = kittens::laneid();
-            const float scale = 2.0f / static_cast<float>(g.batch_size);
+        // LossGrad -Naive 1 thread does the work
+        // static __device__ void run(const linear_training_globals &g, state_t &s) {
+        //     const auto &inst = s.instruction();
+        //     const int out_block = inst[2];
+        //     const int wid = kittens::warpid();
+        //     const int lane = kittens::laneid();
+        //     const float scale = 2.0f / static_cast<float>(g.batch_size);
 
-            if (wid == 0 && lane == 0) {
-                for (int b = 0; b < g.batch_size; b++) {
-                    float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
-                    float *tgt_tile = g.target.raw_ptr + b * OUT_DIM + out_block * BLOCK;
-                    float *grad_tile = g.grad_out.raw_ptr + b * OUT_DIM + out_block * BLOCK;
-                    for (int o = 0; o < BLOCK; o++) {
-                        grad_tile[o] = (out_tile[o] - tgt_tile[o]) * scale;
-                    }
-                }
+        //     if (wid == 0 && lane == 0) {
+        //         for (int b = 0; b < g.batch_size; b++) {
+        //             float *out_tile = g.output.raw_ptr + b * OUT_DIM + out_block * BLOCK;
+        //             float *tgt_tile = g.target.raw_ptr + b * OUT_DIM + out_block * BLOCK;
+        //             float *grad_tile = g.grad_out.raw_ptr + b * OUT_DIM + out_block * BLOCK;
+        //             for (int o = 0; o < BLOCK; o++) {
+        //                 grad_tile[o] = (out_tile[o] - tgt_tile[o]) * scale;
+        //             }
+        //         }
+        //     }
+        // }
+        // LossGrad - 2D Tiled Version
+        static __device__ void run(const linear_training_globals &g, state_t &s) {
+            const auto& inst = s.instruction();
+            const int row_block = inst[2];
+            const int wid  = kittens::warpid();   // row 0..15
+            // const int lane = kittens::laneid();
+            const float scale = 2.f / float(g.batch_size);
+
+            if (wid >= ROW_TILE) return;
+            const int row = row_block * ROW_TILE + wid;
+
+            for (int b = 0; b < g.batch_size; ++b) {
+                float out   = g.output[{b,0,0,row}];
+                float tgt   = g.target[{b,0,0,row}];
+                g.grad_out[{b,0,0,row}] = (out - tgt) * scale;
             }
         }
+
     };
 };
 
@@ -206,29 +272,53 @@ template <typename C = config> struct LinearBwdWeight {
     struct storer { static __device__ void run(const linear_training_globals &, state_t &) {} };
 
     struct consumer {
-        static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const auto &inst = s.instruction();
-            const int out_block = inst[2];
-            const int in_block = inst[3];
-            const int wid = kittens::warpid();
-            const int lane = kittens::laneid();
-            const float inv_batch = 1.0f / static_cast<float>(g.batch_size);
+        // LinearBwdWeight -Naive 1 thread does the work
+        // static __device__ void run(const linear_training_globals &g, state_t &s) {
+        //     const auto &inst = s.instruction();
+        //     const int out_block = inst[2];
+        //     const int in_block = inst[3];
+        //     const int wid = kittens::warpid();
+        //     const int lane = kittens::laneid();
+        //     const float inv_batch = 1.0f / static_cast<float>(g.batch_size);
 
-            if (wid == 0 && lane == 0) {
-                for (int o = 0; o < BLOCK; o++) {
-                    int out_row = out_block * BLOCK + o;
-                    float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
-                    for (int k = 0; k < BLOCK; k++) {
-                        float acc = 0.f;
-                        for (int b = 0; b < g.batch_size; b++) {
-                            float grad = g.grad_out.raw_ptr[b * OUT_DIM + out_row];
-                            float in_val = g.input.raw_ptr[b * IN_DIM + in_block * BLOCK + k];
-                            acc += grad * in_val;
-                        }
-                        grad_w_row[k] = acc * inv_batch;
-                    }
-                }
+        //     if (wid == 0 && lane == 0) {
+        //         for (int o = 0; o < BLOCK; o++) {
+        //             int out_row = out_block * BLOCK + o;
+        //             float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
+        //             for (int k = 0; k < BLOCK; k++) {
+        //                 float acc = 0.f;
+        //                 for (int b = 0; b < g.batch_size; b++) {
+        //                     float grad = g.grad_out.raw_ptr[b * OUT_DIM + out_row];
+        //                     float in_val = g.input.raw_ptr[b * IN_DIM + in_block * BLOCK + k];
+        //                     acc += grad * in_val;
+        //                 }
+        //                 grad_w_row[k] = acc * inv_batch;
+        //             }
+        //         }
+        //     }
+        // }
+        // LinearBwdWeight - 2D Tiled Version
+        static __device__ void run(const linear_training_globals &g, state_t &s) {
+            const auto& inst = s.instruction();
+            const int row_block = inst[2];
+            const int col_block = inst[3];
+
+            const int wid  = kittens::warpid();   // row
+            const int lane = kittens::laneid();   // col
+            if (wid >= ROW_TILE || lane >= COL_TILE) return;
+
+            const int row = row_block * ROW_TILE + wid;
+            const int col = col_block * COL_TILE + lane;
+
+            float acc = 0.f;
+
+            for (int b = 0; b < g.batch_size; ++b) {
+                float go = g.grad_out[{b,0,0,row}]; // grad wrt output (scalar per row)
+                float x  = g.input[{b,0,0,col}];    // one input element
+                acc += go * x;
             }
+
+            g.grad_w[{0,0,row,col}] = acc / float(g.batch_size);
         }
     };
 };
@@ -268,23 +358,42 @@ template <typename C = config> struct SgdUpdate {
     struct storer { static __device__ void run(const linear_training_globals &, state_t &) {} };
 
     struct consumer {
-        static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const auto &inst = s.instruction();
-            const int out_block = inst[2];
-            const int in_block = inst[3];
-            const int wid = kittens::warpid();
-            const int lane = kittens::laneid();
+        // SgdUpdate -Naive 1 thread does the work
+        // static __device__ void run(const linear_training_globals &g, state_t &s) {
+        //     const auto &inst = s.instruction();
+        //     const int out_block = inst[2];
+        //     const int in_block = inst[3];
+        //     const int wid = kittens::warpid();
+        //     const int lane = kittens::laneid();
 
-            if (wid == 0 && lane == 0) {
-                for (int o = 0; o < BLOCK; o++) {
-                    int out_row = out_block * BLOCK + o;
-                    float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
-                    float *w_row = g.weights.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
-                    for (int k = 0; k < BLOCK; k++) {
-                        w_row[k] -= g.lr * grad_w_row[k];
-                    }
-                }
-            }
+        //     if (wid == 0 && lane == 0) {
+        //         for (int o = 0; o < BLOCK; o++) {
+        //             int out_row = out_block * BLOCK + o;
+        //             float *grad_w_row = g.grad_w.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
+        //             float *w_row = g.weights.raw_ptr + out_row * IN_DIM + in_block * BLOCK;
+        //             for (int k = 0; k < BLOCK; k++) {
+        //                 w_row[k] -= g.lr * grad_w_row[k];
+        //             }
+        //         }
+        //     }
+        // }
+        // SgdUpdate - 2D Tiled Version
+        static __device__ void run(const linear_training_globals &g, state_t &s) {
+            const auto& inst = s.instruction();
+            const int row_block = inst[2];
+            const int col_block = inst[3];
+
+            const int wid  = kittens::warpid();
+            const int lane = kittens::laneid();
+            if (wid >= ROW_TILE || lane >= COL_TILE) return;
+
+            const int row = row_block * ROW_TILE + wid;
+            const int col = col_block * COL_TILE + lane;
+
+            float w   = g.weights[{0,0,row,col}];
+            float grad= g.grad_w[{0,0,row,col}];
+
+            g.weights[{0,0,row,col}] = w - g.lr * grad;
         }
     };
 };
@@ -340,32 +449,32 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
     typename linear_training_globals::input_t input_layout =
         kittens::make_gl<typename linear_training_globals::input_t>(
             reinterpret_cast<uint64_t>(input.data_ptr<float>()),
-            1,
             batch_size,
+            1,
             1,
             IN_DIM);
 
     typename linear_training_globals::target_t target_layout =
         kittens::make_gl<typename linear_training_globals::target_t>(
             reinterpret_cast<uint64_t>(target.data_ptr<float>()),
-            1,
             batch_size,
+            1,
             1,
             OUT_DIM);
 
     typename linear_training_globals::output_t output_layout =
         kittens::make_gl<typename linear_training_globals::output_t>(
             reinterpret_cast<uint64_t>(output.data_ptr<float>()),
-            1,
             batch_size,
+            1,
             1,
             OUT_DIM);
 
     typename linear_training_globals::grad_out_t grad_out_layout =
         kittens::make_gl<typename linear_training_globals::grad_out_t>(
             reinterpret_cast<uint64_t>(grad_out.data_ptr<float>()),
-            1,
             batch_size,
+            1,
             1,
             OUT_DIM);
 
@@ -373,16 +482,16 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         kittens::make_gl<typename linear_training_globals::weights_t>(
             reinterpret_cast<uint64_t>(weights.data_ptr<float>()),
             1,
-            OUT_DIM,
             1,
+            OUT_DIM,
             IN_DIM);
 
     typename linear_training_globals::grad_w_t grad_w_layout =
         kittens::make_gl<typename linear_training_globals::grad_w_t>(
             reinterpret_cast<uint64_t>(grad_w.data_ptr<float>()),
             1,
-            OUT_DIM,
             1,
+            OUT_DIM,
             IN_DIM);
 
     linear_training_globals g{
