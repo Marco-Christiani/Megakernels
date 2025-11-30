@@ -9,6 +9,7 @@
 
 #include <iostream>
 #include <vector>
+#include <cstdio>
 
 constexpr int IN_DIM = 128;
 constexpr int OUT_DIM = 64;
@@ -19,6 +20,103 @@ constexpr int COL_TILE = 32;
 
 using config = linear_training_mk_demo_config;
 using state_t = megakernel::state<config>;
+
+template <typename Config, typename Globals>
+struct linear_fwd_pipeline {
+    using state_t = megakernel::state<Config>;
+
+    // Single logical page reserved for weights.
+    static constexpr int WEIGHTS_LID = 0;
+    static constexpr int SEM_WEIGHTS_READY = 0;
+    static constexpr int SEM_COUNT = 1;
+
+    __device__ static int weights_pid(state_t &s) {
+        return s.pid(WEIGHTS_LID);
+    }
+
+    __device__ static kittens::semaphore &weights_ready(state_t &s) {
+        return s.semaphores()[SEM_WEIGHTS_READY];
+    }
+
+    __device__ static kittens::st_fl<ROW_TILE, COL_TILE> &weights_tile(state_t &s) {
+        // Use the VM page as backing storage for the tile.
+        return *reinterpret_cast<kittens::st_fl<ROW_TILE, COL_TILE> *>(
+            s.pages[weights_pid(s)].ptr()
+        );
+    }
+
+    static __device__ int init_semaphores(state_t &s) {
+        if (kittens::laneid() == 0) {
+            kittens::init_semaphore(weights_ready(s), 1);
+        }
+        return SEM_COUNT;
+    }
+
+    // Loader:
+    //  - wait for the weights page
+    //  - fill the 16x32 tile
+    //  - signal consumers via a single semaphore (parity fixed at 0)
+    static __device__ void loader_fill(state_t &s, const Globals &g) {
+        const int lane = kittens::laneid();
+        const auto &inst = s.instruction();
+        const int row_block = inst[2];
+        const int col_block = inst[3];
+        const int pid = weights_pid(s);
+
+        if (lane == 0) {
+            printf("[linear-training loader] worker=%u inst=%d waiting for weights page pid=%d row_block=%d col_block=%d\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   pid,
+                   row_block,
+                   col_block);
+        }
+
+        s.wait_page_ready(pid);
+        __syncwarp();
+
+        auto &tile = weights_tile(s);
+
+        // Fill the 16x32 tile from global weights.
+        for (int linear = lane; linear < ROW_TILE * COL_TILE; linear += kittens::WARP_THREADS) {
+            int tile_row = linear / COL_TILE;
+            int tile_col = linear % COL_TILE;
+            int row      = row_block * ROW_TILE + tile_row;
+            int col      = col_block * COL_TILE + tile_col;
+
+            float val = 0.f;
+            if (row < OUT_DIM && col < IN_DIM) {
+                val = g.weights[{0, 0, row, col}];
+            }
+            tile[make_int2(tile_row, tile_col)] = val;
+        }
+        __syncwarp();  // ensure the tile is fully populated before consumers read it
+
+        if (kittens::laneid() == 0) {
+            kittens::arrive(weights_ready(s));
+            printf("[linear-training loader] worker=%u inst=%d arrived weights_ready pid=%d\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   pid);
+        }
+    }
+
+    // Called once per warp after it finishes using the weights tile.
+    static __device__ void release_weights_page(state_t &s) {
+        const int lane = kittens::laneid();
+        if (lane == 0) {
+            // One arrival per warp. Config::NUM_CONSUMER_WARPS arrivals total.
+            int weights_pid_val = weights_pid(s);
+            s.warp_finish_page(weights_pid_val, 1);
+            printf("[linear-training release] worker=%u inst=%d warp=%d released weights pid=%d\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   kittens::warpid(),
+                   weights_pid_val);
+        }
+    }
+};
+
 
 struct linear_training_globals {
     using instruction_layout = megakernel::instruction_layout<config>;
@@ -47,24 +145,30 @@ struct linear_training_globals {
     int dynamic_shared_memory() const { return config::DYNAMIC_SHARED_MEMORY; }
 };
 
-template <typename C = config> struct LinearFwd {
+template <typename C = config>
+struct LinearFwd {
     static constexpr int opcode = 1;
+    using pipeline = linear_fwd_pipeline<C, linear_training_globals>;
 
+    // Design note: this op uses a single logical page (WEIGHTS_LID) and a single
+    // dynamic semaphore (weights_ready, parity fixed at 0). The loader warp alone
+    // waits for the weights page, fills the shared tile, and arrives the semaphore.
+    // All NUM_CONSUMER_WARPS consumer warps wait on that semaphore before reading
+    // the tile and each calls warp_finish_page once, no block-wide syncs exist in
+    // the loader path, so only the participating warp ever stalls.
     struct controller {
-        static __device__ int init_semaphores(const linear_training_globals &, state_t &) { return 0; }
+        static __device__ int init_semaphores(const linear_training_globals &, state_t &s) {
+            return pipeline::init_semaphores(s);
+        }
         static __device__ int release_lid(const linear_training_globals &, typename C::instruction_t &, int &query) {
+            // Simple round-robin logical ID assignment, as before.
             return query % C::NUM_PAGES;
         }
     };
 
     struct loader {
-        static __device__ void run(const linear_training_globals &, state_t &s) {
-            const int lane = kittens::laneid();
-            if (lane >= 1 && lane < C::NUM_PAGES) {
-                const int pid = s.pid(lane);
-                s.wait_page_ready(pid);
-                s.finish_page(pid, C::NUM_CONSUMER_WARPS);
-            }
+        static __device__ void run(const linear_training_globals &g, state_t &s) {
+            pipeline::loader_fill(s, g);
         }
     };
 
@@ -79,50 +183,75 @@ template <typename C = config> struct LinearFwd {
         }
     };
 
-    struct storer { static __device__ void run(const linear_training_globals &, state_t &) {} };
+    struct storer {
+        static __device__ void run(const linear_training_globals &, state_t &) {}
+    };
 
     struct consumer {
-        // LinearFwd
         static __device__ void run(const linear_training_globals &g, state_t &s) {
             const auto &inst = s.instruction();
             const int out_block = inst[2];
-            const int in_block = inst[3];
+            const int in_block  = inst[3];
 
-            const int wid = kittens::warpid();
-            const int lane = kittens::laneid();
+            const int wid  = kittens::warpid();    // 0..15
+            const int lane = kittens::laneid();    // 0..31
 
-            const int row = ROW_TILE * out_block + wid; // out row idx
-            const int col = COL_TILE * in_block + lane; // in col idx
+            const int row = ROW_TILE * out_block + wid;
+            const int col = COL_TILE * in_block  + lane;
+
+            if (lane == 0) {
+                printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d row=%d col_block=%d active=%d\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       wid,
+                       row,
+                       in_block,
+                       (int)(row < OUT_DIM));
+            }
 
             if (g.debug_vis && lane == 0 && s.instruction_index == 0 && wid == 0) {
                 printf("[linear-training-mk-demo] worker_id=%u opcode=%d instruction_rows=%d\n",
-                       (unsigned)megakernel::get_worker_id(), inst[0], (int)g.instructions.rows());
+                       (unsigned)megakernel::get_worker_id(),
+                       inst[0],
+                       (int)g.instructions.rows());
             }
 
-            if (row >= OUT_DIM || col >= IN_DIM) {
-                return;
-            }
+            kittens::wait(pipeline::weights_ready(s), 0);
+            __syncwarp();
 
-            for (int b = 0; b < g.batch_size; ++b) {
-                // using their operator overload from ThunderKittens/include/types/global/gl.cuh
-                // input[b, col]
-                const float x_val = g.input[{b, 0, 0, col}];
-                const float w_val = g.weights[{0, 0, row, col}];
+            auto &weights_tile = pipeline::weights_tile(s);
 
-                float partial = x_val * w_val;
+            // Some warps may not correspond to a valid output row.
+            const bool active = (row < OUT_DIM);
 
-                float dot = partial;
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    dot += __shfl_down_sync(0xffffffff, dot, offset);
+            if (active) {
+                float w_lane = weights_tile[make_int2(wid, lane)];
+
+                for (int b = 0; b < g.batch_size; ++b) {
+                    float x_val = g.input[{b, 0, 0, col}];
+                    float partial = x_val * w_lane;
+
+                    float dot = partial;
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        dot += __shfl_down_sync(0xffffffff, dot, offset);
+                    }
+
+                    if (lane == 0) {
+                        printf("[linear-training fwd-consumer] worker=%u inst=%d wid=%d batch=%d partial=%f\n",
+                               (unsigned)megakernel::get_worker_id(),
+                               s.instruction_index,
+                               wid,
+                               b,
+                               dot);
+                        float old = (in_block == 0) ? 0.0f : g.output[{b, 0, 0, row}];
+                        g.output[{b, 0, 0, row}] = old + dot;
+                    }
                 }
-
-                if (lane == 0) {
-                    // First input-block starts from 0, later blocks accumulate
-                    const float old = (in_block == 0) ? 0.0f : g.output[{b, 0, 0, row}];
-                    g.output[{b, 0, 0, row}] = old + dot;
-                }
             }
+
+            // Every warp must contribute to releasing the weights page.
+            pipeline::release_weights_page(s);
         }
     };
 };
@@ -168,6 +297,15 @@ template <typename C = config> struct LossGrad {
             const int row_block = inst[2];
             const int wid  = kittens::warpid();   // row 0..15
             const float scale = 2.f / float(g.batch_size);
+            const int lane = kittens::laneid();
+
+            if (lane == 0) {
+                printf("[linear-training lossgrad] worker=%u inst=%d row_block=%d wid=%d\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       row_block,
+                       wid);
+            }
 
             if (wid >= ROW_TILE) return;
             const int row = row_block * ROW_TILE + wid;
@@ -176,6 +314,14 @@ template <typename C = config> struct LossGrad {
                 float out   = g.output[{b,0,0,row}];
                 float tgt   = g.target[{b,0,0,row}];
                 g.grad_out[{b,0,0,row}] = (out - tgt) * scale;
+                if (lane == 0) {
+                    printf("[linear-training lossgrad] worker=%u inst=%d wid=%d batch=%d grad=%f\n",
+                           (unsigned)megakernel::get_worker_id(),
+                           s.instruction_index,
+                           wid,
+                           b,
+                           g.grad_out[{b,0,0,row}]);
+                }
             }
         }
 
@@ -230,15 +376,42 @@ template <typename C = config> struct LinearBwdWeight {
             const int row = row_block * ROW_TILE + wid;
             const int col = col_block * COL_TILE + lane;
 
+            if (lane == 0) {
+                printf("[linear-training bwd-weight] worker=%u inst=%d row_block=%d col_block=%d wid=%d row=%d\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       row_block,
+                       col_block,
+                       wid,
+                       row);
+            }
+
             float acc = 0.f;
 
             for (int b = 0; b < g.batch_size; ++b) {
                 float go = g.grad_out[{b,0,0,row}]; // grad wrt output (scalar per row)
                 float x  = g.input[{b,0,0,col}];    // one input element
                 acc += go * x;
+                if (lane == 0) {
+                    printf("[linear-training bwd-weight] worker=%u inst=%d wid=%d batch=%d partial=%f\n",
+                           (unsigned)megakernel::get_worker_id(),
+                           s.instruction_index,
+                           wid,
+                           b,
+                           acc);
+                }
             }
 
             g.grad_w[{0,0,row,col}] = acc / float(g.batch_size);
+            if (lane == 0) {
+                printf("[linear-training bwd-weight] worker=%u inst=%d wid=%d row=%d col=%d grad=%f\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       wid,
+                       row,
+                       col,
+                       g.grad_w[{0,0,row,col}]);
+            }
         }
     };
 };
@@ -291,10 +464,29 @@ template <typename C = config> struct SgdUpdate {
             const int row = row_block * ROW_TILE + wid;
             const int col = col_block * COL_TILE + lane;
 
+            if (lane == 0) {
+                printf("[linear-training sgd] worker=%u inst=%d row=%d col_block=%d wid=%d\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       row,
+                       col_block,
+                       wid);
+            }
+
             float w   = g.weights[{0,0,row,col}];
             float grad= g.grad_w[{0,0,row,col}];
 
             g.weights[{0,0,row,col}] = w - g.lr * grad;
+            if (lane == 0) {
+                printf("[linear-training sgd] worker=%u inst=%d row=%d col=%d w_old=%f grad=%f w_new=%f\n",
+                       (unsigned)megakernel::get_worker_id(),
+                       s.instruction_index,
+                       row,
+                       col,
+                       w,
+                       grad,
+                       g.weights[{0,0,row,col}]);
+            }
         }
     };
 };
@@ -408,6 +600,10 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         batch_size,
         debug_vis ? 1 : 0};
 
+    std::cout << "[linear-training host] launching kernel with batch_size=" << batch_size
+              << " lr=" << lr
+              << " debug=" << (debug_vis ? "true" : "false") << std::endl;
+
     megakernel::mk<config,
                    linear_training_globals,
                    LinearFwd<config>,
@@ -416,6 +612,7 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
                    SgdUpdate<config>><<<g.grid(), g.block(), g.dynamic_shared_memory()>>>(g);
 
     cudaError_t err = cudaDeviceSynchronize();
+    std::cout << "[linear-training host] kernel completed err=" << cudaGetErrorString(err) << std::endl;
     TORCH_CHECK(err == cudaSuccess, "linear training kernel launch failed: ", cudaGetErrorString(err));
 
     return {output, grad_out, grad_w, timings};
