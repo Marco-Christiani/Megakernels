@@ -17,6 +17,7 @@ constexpr int OUT_DIM = 64;
 constexpr int ROW_TILE = 16;
 constexpr int COL_TILE = 32;
 
+using weights_tile_t = kittens::st_fl<ROW_TILE, COL_TILE>;
 
 using config = linear_training_mk_demo_config;
 using state_t = megakernel::state<config>;
@@ -24,7 +25,7 @@ using state_t = megakernel::state<config>;
 template <typename Config, typename Globals>
 struct linear_fwd_pipeline {
     using state_t = megakernel::state<Config>;
-    using tile_t = kittens::st_fl<ROW_TILE, COL_TILE>;
+    using tile_t = weights_tile_t;
 
     // Two logical pages reserved for this op: weights + activations.
     static constexpr int WEIGHTS_LID = 0;
@@ -93,20 +94,21 @@ struct linear_fwd_pipeline {
         auto &tile_w = weights_tile(s);
         auto &tile_a = activ_tile(s);
 
-        // Fill the weights tile from global weights.
-        for (int linear = lane; linear < ROW_TILE * COL_TILE; linear += kittens::WARP_THREADS) {
-            int tile_row = linear / COL_TILE;
-            int tile_col = linear % COL_TILE;
-            int row      = row_block * ROW_TILE + tile_row;
-            int col      = col_block * COL_TILE + tile_col;
-
-            float val = 0.f;
-            if (row < OUT_DIM && col < IN_DIM) {
-                val = g.weights[{0, 0, row, col}];
-            }
-            tile_w[make_int2(tile_row, tile_col)] = val;
+        if (lane == 0) {
+            const uint32_t bytes = ROW_TILE * COL_TILE * sizeof(float);
+            auto weight_coord = kittens::coord<>{0, 0, row_block * ROW_TILE, col_block * COL_TILE};
+            kittens::tma::expect(weights_ready(s), tile_w);
+            kittens::tma::load_async<kittens::dim::ROW, kittens::cache_policy::EVICT_FIRST>(
+                tile_w, g.weights, weight_coord, weights_ready(s));
+            printf("[linear-training loader] worker=%u inst=%d launched TMA weights pid=%d bytes=%u coord=(0,0,%d,%d)\n",
+                   (unsigned)megakernel::get_worker_id(),
+                   s.instruction_index,
+                   pid_w,
+                   bytes,
+                   row_block * ROW_TILE,
+                   col_block * COL_TILE);
         }
-        __syncwarp();  // ensure the weights tile is ready
+        __syncwarp();  // ensure the TMA launch is visible before filling other tiles
 
         // Fill the activation tile with cached batch-0 activations.
         for (int linear = lane; linear < ROW_TILE * COL_TILE; linear += kittens::WARP_THREADS) {
@@ -123,12 +125,10 @@ struct linear_fwd_pipeline {
         __syncwarp();
 
         if (kittens::laneid() == 0) {
-            kittens::arrive(weights_ready(s));
             kittens::arrive(activ_ready(s));
-            printf("[linear-training loader] worker=%u inst=%d arrived weights_ready pid=%d and activ_ready pid=%d\n",
+            printf("[linear-training loader] worker=%u inst=%d arrived activ_ready pid=%d (weights_ready via TMA)\n",
                    (unsigned)megakernel::get_worker_id(),
                    s.instruction_index,
-                   pid_w,
                    pid_a);
         }
     }
@@ -166,7 +166,7 @@ struct linear_training_globals {
     using target_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
     using output_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
     using grad_out_t = kittens::gl<float, -1, 1, 1, OUT_DIM>;
-    using weights_t = kittens::gl<float, 1, 1, OUT_DIM, IN_DIM>;
+    using weights_t = kittens::gl<float, 1, 1, OUT_DIM, IN_DIM, weights_tile_t>;
     using grad_w_t = kittens::gl<float, 1, 1, OUT_DIM, IN_DIM>;
 
     instruction_layout instructions;
