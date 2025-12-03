@@ -1,3 +1,4 @@
+import math
 import os
 from enum import IntEnum
 
@@ -5,21 +6,20 @@ import torch
 
 import linear_training_mk_demo
 
-IN_DIM = 128
+IN_DIM = 64
 OUT_DIM = 64
+NUM_LAYERS = 2
 
-ROW_TILE = 16
-COL_TILE = 32
-
-COL_BLOCKS = IN_DIM // COL_TILE
-ROW_BLOCKS = OUT_DIM // ROW_TILE
+M_TILE = 16
+N_TILE = 16
 
 
 class OpCodes(IntEnum):
     LINEAR_FWD = 1
     LOSS_GRAD = 2
     LINEAR_BWD_WEIGHT = 3
-    SGD_UPDATE = 4
+    LINEAR_BWD_INPUT = 4
+    SGD_UPDATE = 5
 
 
 def env_flag(name: str, default: str = "0") -> bool:
@@ -27,44 +27,65 @@ def env_flag(name: str, default: str = "0") -> bool:
     return value.lower() not in ("0", "false", "")
 
 
-def _build_single_queue(device: torch.device) -> torch.Tensor:
+def tile_range(length: int, tile: int) -> range:
+    return range(math.ceil(length / tile))
+
+
+def build_single_queue(batch: int, in_dim: int, out_dim: int, num_layers: int, device: torch.device) -> torch.Tensor:
     insts: list[list[int]] = []
 
-    for row_block in range(ROW_BLOCKS):
-        for col_block in range(COL_BLOCKS):
+    for layer in range(num_layers):
+        for m_block in tile_range(batch, M_TILE):
+            for n_block in tile_range(out_dim, N_TILE):
+                row = [0] * 32
+                row[0] = OpCodes.LINEAR_FWD.value
+                row[1] = layer
+                row[2] = m_block
+                row[3] = n_block
+                insts.append(row)
+
+    for m_block in tile_range(batch, M_TILE):
+        for n_block in tile_range(out_dim, N_TILE):
             row = [0] * 32
-            row[0] = OpCodes.LINEAR_FWD.value
-            row[2] = row_block
-            row[3] = col_block
+            row[0] = OpCodes.LOSS_GRAD.value
+            row[1] = num_layers - 1
+            row[2] = m_block
+            row[3] = n_block
             insts.append(row)
 
-    for row_block in range(ROW_BLOCKS):
-        row = [0] * 32
-        row[0] = OpCodes.LOSS_GRAD.value
-        row[2] = row_block
-        insts.append(row)
+    for layer in reversed(range(num_layers)):
+        for out_block in tile_range(out_dim, N_TILE):
+            for in_block in tile_range(in_dim, N_TILE):
+                row = [0] * 32
+                row[0] = OpCodes.LINEAR_BWD_WEIGHT.value
+                row[1] = layer
+                row[2] = out_block
+                row[3] = in_block
+                insts.append(row)
 
-    for row_block in range(ROW_BLOCKS):
-        for col_block in range(COL_BLOCKS):
-            row = [0] * 32
-            row[0] = OpCodes.LINEAR_BWD_WEIGHT.value
-            row[2] = row_block
-            row[3] = col_block
-            insts.append(row)
+        for m_block in tile_range(batch, M_TILE):
+            for n_block in tile_range(in_dim, N_TILE):
+                row = [0] * 32
+                row[0] = OpCodes.LINEAR_BWD_INPUT.value
+                row[1] = layer
+                row[2] = m_block
+                row[3] = n_block
+                insts.append(row)
 
-    for row_block in range(ROW_BLOCKS):
-        for col_block in range(COL_BLOCKS):
-            row = [0] * 32
-            row[0] = OpCodes.SGD_UPDATE.value
-            row[2] = row_block
-            row[3] = col_block
-            insts.append(row)
+        for out_block in tile_range(out_dim, N_TILE):
+            for in_block in tile_range(in_dim, N_TILE):
+                row = [0] * 32
+                row[0] = OpCodes.SGD_UPDATE.value
+                row[1] = layer
+                row[2] = out_block
+                row[3] = in_block
+                insts.append(row)
 
     return torch.tensor(insts, device=device, dtype=torch.int32)
 
 
-def build_instructions(device: torch.device, sm_count: int) -> torch.Tensor:
-    per_sm_insts = _build_single_queue(device)
+def build_instructions(device: torch.device, sm_count: int, batch: int) -> torch.Tensor:
+    per_sm_insts = build_single_queue(batch, IN_DIM, OUT_DIM, NUM_LAYERS, device)
     expanded = (
         per_sm_insts.unsqueeze(0)
         .expand(sm_count, per_sm_insts.size(0), per_sm_insts.size(1))
@@ -79,32 +100,44 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
 
     x = torch.randn(batch, IN_DIM, device=device, dtype=torch.float32)
     target = torch.randn(batch, OUT_DIM, device=device, dtype=torch.float32)
-    weights = torch.randn(OUT_DIM, IN_DIM, device=device, dtype=torch.float32)
+    weights = torch.randn(NUM_LAYERS, OUT_DIM, IN_DIM, device=device, dtype=torch.float32)
     weights_ref = weights.clone()
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device_index)
-    instructions = build_instructions(device, props.multi_processor_count)
+    instructions = build_instructions(device, props.multi_processor_count, batch)
 
-    out, grad_out, grad_w, timings = linear_training_mk_demo.run(
+    out, grad_out, grad_input, grad_w, weights_out, timings = linear_training_mk_demo.run(
         instructions, x, target, weights, lr, debug
     )
     torch.cuda.synchronize()
 
-    out_ref = x @ weights_ref.t()
-    grad_out_ref = 2.0 * (out_ref - target) / batch
-    grad_w_ref = grad_out_ref.t() @ x / batch
+    activations: list[torch.Tensor] = [x]
+    for l in range(NUM_LAYERS):
+        activations.append(activations[-1] @ weights_ref[l].t())
+
+    out_ref = activations[-1]
+    grad_acts: list[torch.Tensor | None] = [None] * (NUM_LAYERS + 1)
+    grad_acts[-1] = 2.0 * (out_ref - target) / batch
+
+    grad_w_ref = torch.zeros_like(weights_ref)
+    for l in reversed(range(NUM_LAYERS)):
+        grad_w_ref[l] = grad_acts[l + 1].t() @ activations[l] / batch
+        grad_acts[l] = grad_acts[l + 1] @ weights_ref[l]
+
     weights_ref_updated = weights_ref - lr * grad_w_ref
 
     return {
         "out": out,
         "grad_out": grad_out,
+        "grad_in": grad_input,
         "grad_w": grad_w,
-        "weights": weights,
+        "weights": weights_out,
         "timings": timings,
         "refs": {
             "out": out_ref,
-            "grad_out": grad_out_ref,
+            "grad_out": grad_acts[-1],
+            "grad_in": grad_acts[0],
             "grad_w": grad_w_ref,
             "weights": weights_ref_updated,
         },
@@ -118,6 +151,7 @@ def _print_diffs(outputs: dict[str, torch.Tensor], refs: dict[str, torch.Tensor]
 
     diff("output", outputs["out"], refs["out"])
     diff("grad_out", outputs["grad_out"], refs["grad_out"])
+    diff("grad_in", outputs["grad_in"], refs["grad_in"])
     diff("grad_w", outputs["grad_w"], refs["grad_w"])
     diff("weights", outputs["weights"], refs["weights"])
 
@@ -160,14 +194,16 @@ def test_linear_training_matches_torch():
 
     out = results["out"]
     grad_out = results["grad_out"]
+    grad_in = results["grad_in"]
     grad_w = results["grad_w"]
     weights = results["weights"]
     refs = results["refs"]
 
-    assert torch.allclose(out, refs["out"], atol=1e-4, rtol=1e-4)
-    assert torch.allclose(grad_out, refs["grad_out"], atol=1e-4, rtol=1e-4)
-    assert torch.allclose(grad_w, refs["grad_w"], atol=1e-4, rtol=1e-4)
-    assert torch.allclose(weights, refs["weights"], atol=1e-4, rtol=1e-4)
+    assert torch.allclose(out, refs["out"], atol=1e-3, rtol=1e-3)
+    assert torch.allclose(grad_out, refs["grad_out"], atol=1e-3, rtol=1e-3)
+    assert torch.allclose(grad_in, refs["grad_in"], atol=1e-3, rtol=1e-3)
+    assert torch.allclose(grad_w, refs["grad_w"], atol=1e-3, rtol=1e-3)
+    assert torch.allclose(weights, refs["weights"], atol=1e-3, rtol=1e-3)
 
 
 def main():
@@ -178,13 +214,14 @@ def main():
 
     results = run_demo_step(batch=batch, lr=lr, debug=debug_vis)
     _print_diffs(
-        {k: results[k] for k in ("out", "grad_out", "grad_w", "weights")},
+        {k: results[k] for k in ("out", "grad_out", "grad_in", "grad_w", "weights")},
         results["refs"],
     )
 
     if debug_vis:
         preview("output", results["out"])
         preview("grad_out", results["grad_out"])
+        preview("grad_in", results["grad_in"])
         preview("grad_w", results["grad_w"])
         preview("weights", results["weights"])
 

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pybind11
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 # Environment variables
 THUNDERKITTENS_ROOT = os.environ.get("THUNDERKITTENS_ROOT") or str(ROOT.parent / "ThunderKittens")
 MEGAKERNELS_ROOT = os.environ.get("MEGAKERNELS_ROOT") or str(ROOT.parent)
-PYTHON_VERSION = os.environ.get("PYTHON_VERSION", "3.13")
+PYTHON_VERSION = os.environ.get("PYTHON_VERSION", f"{sys.version_info.major}.{sys.version_info.minor}")
 
 # Target GPU (default to HOPPER)
 TARGET = os.environ.get("TARGET_GPU", "HOPPER")  # or BLACKWELL
