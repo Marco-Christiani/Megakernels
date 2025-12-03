@@ -3,6 +3,7 @@ import os
 from enum import IntEnum
 
 import torch
+from torch import inference_mode
 
 import linear_training_mk_demo
 
@@ -13,7 +14,7 @@ NUM_LAYERS = 2
 M_TILE = 16
 N_TILE = 16
 
-# Reference mode: "bf16_manual" or "bf16_autograd"
+# bf16_manual or bf16_autograd
 REF_MODE = os.environ.get("LINEAR_REF_MODE", "bf16_manual")
 
 
@@ -31,8 +32,14 @@ def env_flag(name: str, default: str = "0") -> bool:
 
 
 def matmul_bf16(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Both inputs are rounded to bf16 before the matmul."""
-    return (a.to(torch.bfloat16) @ b.to(torch.bfloat16)).to(torch.float32)
+    """MM mimicking tensor core behavior:
+    - inputs quantized to bf16
+    - fp32 accumulation (no intermediate rounding)
+    - result in fp32
+    """
+    a_bf = a.to(torch.bfloat16).to(torch.float32)  # back to fp32
+    b_bf = b.to(torch.bfloat16).to(torch.float32)
+    return a_bf @ b_bf  # fp32 matmul on bf16-quantized values
 
 
 def linear_forward_bf16(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
@@ -110,6 +117,7 @@ def build_single_queue(batch: int, in_dim: int, out_dim: int, num_layers: int, d
     return torch.tensor(insts, device=device, dtype=torch.int32)
 
 
+@inference_mode()
 def build_instructions(device: torch.device, sm_count: int, batch: int) -> torch.Tensor:
     per_sm_insts = build_single_queue(batch, IN_DIM, OUT_DIM, NUM_LAYERS, device)
     expanded = (
@@ -200,6 +208,7 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
     }
 
 
+@inference_mode()
 def _print_diffs(outputs: dict[str, torch.Tensor], refs: dict[str, torch.Tensor]) -> None:
     def diff(name: str, a: torch.Tensor, b: torch.Tensor):
         diff_tensor = a - b
@@ -218,6 +227,7 @@ def _print_diffs(outputs: dict[str, torch.Tensor], refs: dict[str, torch.Tensor]
 
         print(
             f"{name:12s} "
+            # f"{a.div(b).max():.4} "
             f"max abs diff: {max_diff_val:.4} "
             f"mean abs diff: {mae:.4} "
             f"mse: {mse:.4f} "
@@ -240,6 +250,7 @@ def _print_diffs(outputs: dict[str, torch.Tensor], refs: dict[str, torch.Tensor]
     diff("weights", outputs["weights"], refs["weights"])
 
 
+@inference_mode()
 def preview(name: str, tensor: torch.Tensor, num_values: int = 4) -> None:
     flattened = tensor.detach().flatten().cpu()
     slice_ = flattened[:num_values]
@@ -247,6 +258,7 @@ def preview(name: str, tensor: torch.Tensor, num_values: int = 4) -> None:
     print(f"[linear-training-mk-demo] {name} preview ({num_values}): {formatted}")
 
 
+@inference_mode()
 def summarize_timings(
     timings: torch.Tensor, num_instructions: int, timings_enabled: bool, max_instructions: int = 4
 ) -> None:
@@ -274,7 +286,7 @@ def summarize_timings(
 def test_linear_training_matches_torch():
     torch.manual_seed(0)
 
-    results = run_demo_step(batch=4, lr=0.05, debug=False)
+    results = run_demo_step(batch=4, lr=0.01, debug=False)
 
     out = results["out"]
     grad_out = results["grad_out"]
@@ -289,6 +301,60 @@ def test_linear_training_matches_torch():
     assert torch.allclose(grad_w, refs["grad_w"], atol=1e-3, rtol=1e-3)
     assert torch.allclose(weights, refs["weights"], atol=1e-3, rtol=1e-3)
 
+
+def test_linear_training_bf16_trains_down_loss():
+    """
+    End-to-end training sanity check in a bf16-style regime.
+
+    We:
+      - construct a small, exactly learnable 2-layer linear problem,
+      - generate targets using explicit bf16 matmuls,
+      - run the megakernel SGD for several steps,
+      - and assert that the loss decreases.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    batch = 4
+    lr = 1e-2
+
+    # Inputs
+    x = torch.randn(batch, IN_DIM, device=device, dtype=torch.float32)
+
+    # True weights in bf16, small scale for stability.
+    true_weights_bf = (
+        torch.randn(NUM_LAYERS, OUT_DIM, IN_DIM, device=device, dtype=torch.float32) * 0.25
+    ).to(torch.bfloat16)
+
+    # Generate targets via explicit bf16 matmuls.
+    act = x
+    for l in range(NUM_LAYERS):
+        # W: [out, in], need W.T for [in, out] to do x @ W.T
+        act = matmul_bf16(act, true_weights_bf[l].to(torch.float32).transpose(-1, -2))
+    target = act  # fp32, but came from bf16 math
+
+    # Initialize trainable weights near zero.
+    weights = (
+        torch.randn(NUM_LAYERS, OUT_DIM, IN_DIM, device=device, dtype=torch.float32) * 0.05
+    )
+
+    # Build instructions for this batch once.
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device_index)
+    instructions = build_instructions(device, props.multi_processor_count, batch)
+
+    losses = []
+    num_steps = 16
+    for _ in range(num_steps):
+        out, _, _, _, _, _ = linear_training_mk_demo.run(
+            instructions, x, target, weights, lr, False
+        )
+        torch.cuda.synchronize()
+        loss = ((out - target) ** 2).mean()
+        losses.append(loss.item())
+
+    # Require that training actually reduces loss over time.
+    assert losses[-1] < losses[0], f"bf16-style training did not reduce loss {losses}"
 
 def main():
     debug_vis = env_flag("LINEAR_DEMO_DEBUG")
@@ -331,6 +397,8 @@ def main():
             (sm_count, instructions_per_sm, results["timings"].shape[2]),
         )
         summarize_timings(results["timings"], instructions_per_sm, timings_enabled=env_flag("ENABLE_TIMINGS"))
+
+    test_linear_training_bf16_trains_down_loss()
 
     print("Done.")
 
