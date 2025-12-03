@@ -13,6 +13,9 @@ NUM_LAYERS = 2
 M_TILE = 16
 N_TILE = 16
 
+# Reference mode: "bf16_manual" or "bf16_autograd"
+REF_MODE = os.environ.get("LINEAR_REF_MODE", "bf16_manual")
+
 
 class OpCodes(IntEnum):
     LINEAR_FWD = 1
@@ -25,6 +28,29 @@ class OpCodes(IntEnum):
 def env_flag(name: str, default: str = "0") -> bool:
     value = os.environ.get(name, default)
     return value.lower() not in ("0", "false", "")
+
+
+def matmul_bf16(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Both inputs are rounded to bf16 before the matmul."""
+    return (a.to(torch.bfloat16) @ b.to(torch.bfloat16)).to(torch.float32)
+
+
+def linear_forward_bf16(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    """y = x @ W.T, returning fp32."""
+    return matmul_bf16(x, W.transpose(-1, -2))
+
+
+def linear_backward_bf16(
+    x: torch.Tensor, W: torch.Tensor, grad_out: torch.Tensor, batch: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+      grad_w = grad_out.T @ x / batch
+      grad_in = grad_out @ W
+    where all matmuls are in bf16, results in fp32.
+    """
+    grad_w = matmul_bf16(grad_out.transpose(-1, -2), x) / batch
+    grad_in = matmul_bf16(grad_out, W)
+    return grad_in, grad_w
 
 
 def tile_range(length: int, tile: int) -> range:
@@ -112,20 +138,49 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
     )
     torch.cuda.synchronize()
 
-    activations: list[torch.Tensor] = [x]
-    for l in range(NUM_LAYERS):
-        activations.append(activations[-1] @ weights_ref[l].t())
+    if REF_MODE == "bf16_manual":
+        activations: list[torch.Tensor] = [x]
+        for l in range(NUM_LAYERS):
+            activations.append(linear_forward_bf16(activations[-1], weights_ref[l]))
 
-    out_ref = activations[-1]
-    grad_acts: list[torch.Tensor | None] = [None] * (NUM_LAYERS + 1)
-    grad_acts[-1] = 2.0 * (out_ref - target) / batch
+        out_ref = activations[-1]
 
-    grad_w_ref = torch.zeros_like(weights_ref)
-    for l in reversed(range(NUM_LAYERS)):
-        grad_w_ref[l] = grad_acts[l + 1].t() @ activations[l] / batch
-        grad_acts[l] = grad_acts[l + 1] @ weights_ref[l]
+        grad_acts: list[torch.Tensor | None] = [None] * (NUM_LAYERS + 1)
+        grad_acts[-1] = 2.0 * (out_ref - target) / batch
 
-    weights_ref_updated = weights_ref - lr * grad_w_ref
+        grad_w_ref = torch.zeros_like(weights_ref)
+        for l in reversed(range(NUM_LAYERS)):
+            grad_in_l, grad_w_l = linear_backward_bf16(
+                activations[l], weights_ref[l], grad_acts[l + 1], batch
+            )
+            grad_acts[l] = grad_in_l
+            grad_w_ref[l] = grad_w_l
+
+        grad_out_ref = grad_acts[-1]
+        grad_in_ref = grad_acts[0]
+        weights_ref_updated = weights_ref - lr * grad_w_ref
+
+    elif REF_MODE == "bf16_autograd":
+        x_bf = x.to(torch.bfloat16).detach().requires_grad_(True)
+        weights_bf = weights_ref.to(torch.bfloat16).detach().requires_grad_(True)
+
+        act = x_bf
+        for l in range(NUM_LAYERS):
+            act = act @ weights_bf[l].t()
+        out_bf = act
+        out_bf.retain_grad()
+
+        loss = ((out_bf.to(torch.float32) - target) ** 2).sum() / batch
+        loss.backward()
+
+        out_ref = out_bf.to(torch.float32)
+        grad_out_ref = out_bf.grad.to(torch.float32)
+        grad_in_ref = x_bf.grad.to(torch.float32)
+        grad_w_ref = weights_bf.grad.to(torch.float32)
+        weights_ref_updated = weights_ref - lr * grad_w_ref
+
+    else:
+        raise ValueError(f"Unknown REF_MODE: {REF_MODE}")
 
     return {
         "out": out,
@@ -134,10 +189,11 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
         "grad_w": grad_w,
         "weights": weights_out,
         "timings": timings,
+        "weights_init": weights_ref,
         "refs": {
             "out": out_ref,
-            "grad_out": grad_acts[-1],
-            "grad_in": grad_acts[0],
+            "grad_out": grad_out_ref,
+            "grad_in": grad_in_ref,
             "grad_w": grad_w_ref,
             "weights": weights_ref_updated,
         },
@@ -146,8 +202,36 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
 
 def _print_diffs(outputs: dict[str, torch.Tensor], refs: dict[str, torch.Tensor]) -> None:
     def diff(name: str, a: torch.Tensor, b: torch.Tensor):
-        max_diff = (a - b).abs().max().item()
-        print(f"{name:12s} max diff: {max_diff:.4e}")
+        diff_tensor = a - b
+        abs_diff = diff_tensor.abs()
+        max_diff_val = abs_diff.max().item()
+        mae = abs_diff.mean()
+        mse = diff_tensor.square().mean()
+        std = diff_tensor.std()
+
+        # find worst element
+        flat_idx = abs_diff.view(-1).argmax()
+        unraveled = torch.unravel_index(flat_idx, abs_diff.shape)
+        idx = tuple(int(i) for i in unraveled)
+        a_val = a[idx].item()
+        b_val = b[idx].item()
+
+        print(
+            f"{name:12s} "
+            f"max abs diff: {max_diff_val:.4} "
+            f"mean abs diff: {mae:.4} "
+            f"mse: {mse:.4f} "
+            f"diff std: {std:.4} "
+            f"@idx={idx} (mk={a_val:.4e}, ref={b_val:.4e})"
+        )
+
+        # For 3D tensors like grad_w / weights (L, Out, In) also compare
+        # against a transposed reference to detect pure layout bugs
+        if a.ndim == 3 and b.shape == a.shape:
+            b_T = b.transpose(1, 2).contiguous()
+            trans_diff = (a - b_T).abs()
+            trans_max = trans_diff.max().item()
+            print(f"{name:12s} transposed-ref max abs diff: {trans_max:.4}")
 
     diff("output", outputs["out"], refs["out"])
     diff("grad_out", outputs["grad_out"], refs["grad_out"])
@@ -213,6 +297,20 @@ def main():
     lr = float(os.environ.get("LINEAR_DEMO_LR", "0.05"))
 
     results = run_demo_step(batch=batch, lr=lr, debug=debug_vis)
+
+    # Check whether SGD update matches applying lr * grad_w ONCE to the
+    # initial weights. Yeah, I have a double apply bug..
+    with torch.no_grad():
+        weights_init = results["weights_init"]
+        grad_w = results["grad_w"]
+        weights_out = results["weights"]
+        weights_pred = weights_init - lr * grad_w
+        delta = (weights_out - weights_pred).abs()
+        print(
+            "weights_vs_pred max abs diff:",
+            f"{delta.max().item():.4e}",
+        )
+
     _print_diffs(
         {k: results[k] for k in ("out", "grad_out", "grad_in", "grad_w", "weights")},
         results["refs"],

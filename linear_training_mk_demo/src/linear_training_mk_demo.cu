@@ -77,52 +77,93 @@ struct linear_training_globals {
 
 template <typename Config, typename Globals>
 struct two_page_pipeline {
-    using tile_a_t = activ_tile_t;
-    using tile_b_t = weight_tile_fwd_t;
+    using state_t   = megakernel::state<Config>;
+    using tile_a_t  = activ_tile_t;
+    using tile_b_t  = weight_tile_fwd_t;
 
-    static constexpr int A_LID = 0;
-    static constexpr int B_LID = 1;
-    static constexpr int SEM_A_READY = 0;
-    static constexpr int SEM_B_READY = 1;
-    static constexpr int SEM_COUNT = 2;
+    // Two pages per operand (ping–pong)
+    static constexpr int A0_LID = 0;
+    static constexpr int A1_LID = 1;
+    static constexpr int B0_LID = 2;
+    static constexpr int B1_LID = 3;
 
-    __device__ static int a_pid(state_t &s) { return s.pid(A_LID); }
-    __device__ static int b_pid(state_t &s) { return s.pid(B_LID); }
+    // Two pipeline stages (stage == parity)
+    static constexpr int INPUT_PIPELINE_STAGES = 2;
 
-    __device__ static tile_a_t &a_tile(state_t &s) {
-        return *reinterpret_cast<tile_a_t *>(s.pages[a_pid(s)].ptr());
+    // Semaphore layout:
+    //   0,1 : A arrived [stage 0/1]
+    //   2,3 : B arrived [stage 0/1]
+    //   4,5 : A finished [stage 0/1]
+    //   6,7 : B finished [stage 0/1]
+    static constexpr int SEM_A_ARR_0 = 0;
+    static constexpr int SEM_A_ARR_1 = 1;
+    static constexpr int SEM_B_ARR_0 = 2;
+    static constexpr int SEM_B_ARR_1 = 3;
+    static constexpr int SEM_A_FIN_0 = 4;
+    static constexpr int SEM_A_FIN_1 = 5;
+    static constexpr int SEM_B_FIN_0 = 6;
+    static constexpr int SEM_B_FIN_1 = 7;
+    static constexpr int SEM_COUNT   = 8;
+
+    // --- page helpers -----------------------------------------------------
+    __device__ static int a_pid(state_t &s, int stage) {
+        return s.pid(stage ? A1_LID : A0_LID);
     }
-    __device__ static tile_b_t &b_tile(state_t &s) {
-        return *reinterpret_cast<tile_b_t *>(s.pages[b_pid(s)].ptr());
+    __device__ static int b_pid(state_t &s, int stage) {
+        return s.pid(stage ? B1_LID : B0_LID);
     }
 
-    __device__ static kittens::semaphore &a_ready(state_t &s) {
-        return s.semaphores()[SEM_A_READY];
+    __device__ static tile_a_t &a_tile(state_t &s, int stage) {
+        return *reinterpret_cast<tile_a_t *>(s.pages[a_pid(s, stage)].ptr());
     }
-    __device__ static kittens::semaphore &b_ready(state_t &s) {
-        return s.semaphores()[SEM_B_READY];
+    __device__ static tile_b_t &b_tile(state_t &s, int stage) {
+        return *reinterpret_cast<tile_b_t *>(s.pages[b_pid(s, stage)].ptr());
+    }
+
+    // --- semaphore helpers ------------------------------------------------
+    __device__ static kittens::semaphore &a_arrived(state_t &s, int stage) {
+        return s.semaphores()[stage ? SEM_A_ARR_1 : SEM_A_ARR_0];
+    }
+    __device__ static kittens::semaphore &b_arrived(state_t &s, int stage) {
+        return s.semaphores()[stage ? SEM_B_ARR_1 : SEM_B_ARR_0];
+    }
+    __device__ static kittens::semaphore &a_finished(state_t &s, int stage) {
+        return s.semaphores()[stage ? SEM_A_FIN_1 : SEM_A_FIN_0];
+    }
+    __device__ static kittens::semaphore &b_finished(state_t &s, int stage) {
+        return s.semaphores()[stage ? SEM_B_FIN_1 : SEM_B_FIN_0];
     }
 
     static __device__ int init_semaphores(state_t &s) {
         if (kittens::laneid() == 0) {
-            kittens::init_semaphore(a_ready(s), 1);
-            kittens::init_semaphore(b_ready(s), 1);
+            // ready / arrived semaphores start with 1 token (TK pattern)
+            kittens::init_semaphore(a_arrived(s, 0), 1);
+            kittens::init_semaphore(a_arrived(s, 1), 1);
+            kittens::init_semaphore(b_arrived(s, 0), 1);
+            kittens::init_semaphore(b_arrived(s, 1), 1);
+
+            // finished semaphores throttle the loader (one credit per consumer warp)
+            kittens::init_semaphore(a_finished(s, 0), Config::NUM_CONSUMER_WARPS);
+            kittens::init_semaphore(a_finished(s, 1), Config::NUM_CONSUMER_WARPS);
+            kittens::init_semaphore(b_finished(s, 0), Config::NUM_CONSUMER_WARPS);
+            kittens::init_semaphore(b_finished(s, 1), Config::NUM_CONSUMER_WARPS);
         }
         return SEM_COUNT;
     }
 
-    static __device__ void wait_pages(state_t &s) {
-        s.wait_page_ready(a_pid(s));
-        s.wait_page_ready(b_pid(s));
-        __syncwarp();
+    // Bit pattern copied from matvec_pipeline:
+    //  - loader waits on *_finished with bit = (iter % (2*STAGES)) < STAGES
+    //  - consumer waits on *_arrived with bit = (iter % (2*STAGES)) >= STAGES
+    __device__ static int loader_wait_bit(int iter) {
+        return (iter % (2 * INPUT_PIPELINE_STAGES)) < INPUT_PIPELINE_STAGES;
+    }
+    __device__ static int consumer_wait_bit(int iter) {
+        return (iter % (2 * INPUT_PIPELINE_STAGES)) >= INPUT_PIPELINE_STAGES;
     }
 
-    static __device__ void release_pages(state_t &s) {
-        if (kittens::laneid() == 0) {
-            s.warp_finish_page(a_pid(s), 1);
-            s.warp_finish_page(b_pid(s), 1);
-        }
-    }
+    // We no longer use global wait/release; handled per-tile
+    static __device__ void wait_pages(state_t &) {}
+    static __device__ void release_pages(state_t &) {}
 };
 
 __device__ inline int get_in_dim(const linear_training_globals &g, int layer) {
@@ -137,60 +178,78 @@ template <typename C = config>
 struct LinearFwd {
     static constexpr int opcode = OpCode::LINEAR_FWD;
     using pipeline = two_page_pipeline<C, linear_training_globals>;
+    using state_t  = megakernel::state<C>;
 
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &s) {
             return pipeline::init_semaphores(s);
         }
-        static __device__ int release_lid(const linear_training_globals &, typename C::instruction_t &, int &query) {
-            if (query == 0) return pipeline::A_LID;
-            if (query == 1) return pipeline::B_LID;
+
+        static __device__ int release_lid(
+            const linear_training_globals &, typename C::instruction_t &, int &query
+        ) {
+            if (query == 0) return pipeline::A0_LID;
+            if (query == 1) return pipeline::A1_LID;
+            if (query == 2) return pipeline::B0_LID;
+            if (query == 3) return pipeline::B1_LID;
             return query % C::NUM_PAGES;
         }
     };
 
     struct loader {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const int lane = kittens::laneid();
+            const int lane   = kittens::laneid();
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer  = inst[1];
             const int m_block = inst[2];
             const int n_block = inst[3];
 
-            pipeline::wait_pages(s);
-
-            const int in_dim = get_in_dim(g, layer);
+            const int in_dim  = get_in_dim(g, layer);
             const int k_tiles = div_up(in_dim, K_TILE);
 
             for (int kt = 0; kt < k_tiles; ++kt) {
-                const int parity = kt & 1;
-                const int k_start = kt * K_TILE;
+                const int stage       = kt % pipeline::INPUT_PIPELINE_STAGES;
+                const int k_start     = kt * K_TILE;
+                const int loader_bit  = pipeline::loader_wait_bit(kt);
 
                 if (lane == 0) {
-                    kittens::tma::expect_bytes(pipeline::a_ready(s), sizeof(float) * M_TILE * K_TILE);
-                    kittens::tma::expect_bytes(pipeline::b_ready(s), sizeof(float) * N_TILE * K_TILE);
+                    // Throttle: don’t reuse stage until consumer marks finished.
+                    kittens::wait(pipeline::a_finished(s, stage), loader_bit);
+                    kittens::wait(pipeline::b_finished(s, stage), loader_bit);
+
+                    // TK-style page credit: only during initial pipeline fill.
+                    if (kt < pipeline::INPUT_PIPELINE_STAGES) {
+                        s.wait_page_ready(pipeline::a_pid(s, stage));
+                        s.wait_page_ready(pipeline::b_pid(s, stage));
+                    }
+
+                    const size_t bytes_a = sizeof(float) * M_TILE * K_TILE;
+                    const size_t bytes_b = sizeof(float) * N_TILE * K_TILE;
+
+                    kittens::tma::expect_bytes(pipeline::a_arrived(s, stage), bytes_a);
+                    kittens::tma::expect_bytes(pipeline::b_arrived(s, stage), bytes_b);
 
                     kittens::tma::load_async(
-                        pipeline::a_tile(s),
+                        pipeline::a_tile(s, stage),
                         g.activations,
                         kittens::coord<>{layer, 0, m_block * M_TILE, k_start},
-                        pipeline::a_ready(s));
+                        pipeline::a_arrived(s, stage)
+                    );
 
                     kittens::tma::load_async(
-                        pipeline::b_tile(s),
+                        pipeline::b_tile(s, stage),
                         g.weights,
                         kittens::coord<>{layer, 0, n_block * N_TILE, k_start},
-                        pipeline::b_ready(s));
+                        pipeline::b_arrived(s, stage)
+                    );
 
                     if (g.debug_vis) {
-                        printf("[fwd-loader] layer=%d m_blk=%d n_blk=%d kt=%d pidA=%d pidB=%d\n",
-                               layer, m_block, n_block, kt, pipeline::a_pid(s), pipeline::b_pid(s));
+                        printf("[fwd-loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                               layer, m_block, n_block, kt, stage,
+                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
                     }
                 }
 
-                // make sure data is visible before consumers advance
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
                 __syncwarp();
             }
         }
@@ -214,42 +273,58 @@ struct LinearFwd {
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer   = inst[1];
             const int m_block = inst[2];
             const int n_block = inst[3];
 
             const int m_start = m_block * M_TILE;
             const int n_start = n_block * N_TILE;
-            const int in_dim = get_in_dim(g, layer);
-            const int out_dim = get_out_dim(g, layer);
+            const int in_dim  = get_in_dim(g, layer);
             const int k_tiles = div_up(in_dim, K_TILE);
 
             output_frag_t c_frag;
             kittens::warp::zero(c_frag);
 
             for (int kt = 0; kt < k_tiles; ++kt) {
-                const int parity = kt & 1;
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
+                const int stage        = kt % pipeline::INPUT_PIPELINE_STAGES;
+                const int consumer_bit = pipeline::consumer_wait_bit(kt);
+
+                // Wait for TMA to finish for this stage.
+                kittens::wait(pipeline::a_arrived(s, stage), consumer_bit);
+                kittens::wait(pipeline::b_arrived(s, stage), consumer_bit);
                 __syncwarp();
 
-                activ_frag_t a_frag;
-                weight_frag_fwd_t b_frag;
-                kittens::warp::load(a_frag, pipeline::a_tile(s));
-                kittens::warp::load(b_frag, pipeline::b_tile(s));
+                activ_frag_t        a_frag;
+                weight_frag_fwd_t   b_frag;
+                kittens::warp::load(a_frag, pipeline::a_tile(s, stage));
+                kittens::warp::load(b_frag, pipeline::b_tile(s, stage));
                 kittens::warp::mma_ABt(c_frag, a_frag, b_frag, c_frag);
-
                 __syncwarp();
+
+                // Tell loader this stage is finished and return page credit.
+                kittens::warp::arrive(pipeline::a_finished(s, stage));
+                kittens::warp::arrive(pipeline::b_finished(s, stage));
+
+                // TK-style page release: only in final pipeline iterations.
+                if (kt >= k_tiles - pipeline::INPUT_PIPELINE_STAGES) {
+                    if (kittens::laneid() == 0) {
+                        s.warp_finish_page(pipeline::a_pid(s, stage), 1);
+                        s.warp_finish_page(pipeline::b_pid(s, stage), 1);
+                    }
+                }
             }
 
-            // store full tile, padding guarantees bounds
-            kittens::warp::store(g.activations, c_frag, kittens::coord<>{layer + 1, 0, m_start, n_start});
+            // Store entire tile (padding ensures safe bounds).
+            kittens::warp::store(
+                g.activations,
+                c_frag,
+                kittens::coord<>{layer + 1, 0, m_start, n_start}
+            );
 
             if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
-                printf("[fwd-consumer] layer=%d m_blk=%d n_blk=%d wrote tile\n", layer, m_block, n_block);
+                printf("[fwd-consumer] layer=%d m_blk=%d n_blk=%d wrote tile\n",
+                       layer, m_block, n_block);
             }
-
-            pipeline::release_pages(s);
         }
     };
 };
@@ -318,58 +393,76 @@ template <typename C = config>
 struct LinearBwdWeight {
     static constexpr int opcode = OpCode::LINEAR_BWD_WEIGHT;
     using pipeline = two_page_pipeline<C, linear_training_globals>;
+    using state_t  = megakernel::state<C>;
 
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &s) {
             return pipeline::init_semaphores(s);
         }
-        static __device__ int release_lid(const linear_training_globals &, typename C::instruction_t &, int &query) {
-            if (query == 0) return pipeline::A_LID;
-            if (query == 1) return pipeline::B_LID;
+
+        static __device__ int release_lid(
+            const linear_training_globals &, typename C::instruction_t &, int &query
+        ) {
+            if (query == 0) return pipeline::A0_LID;
+            if (query == 1) return pipeline::A1_LID;
+            if (query == 2) return pipeline::B0_LID;
+            if (query == 3) return pipeline::B1_LID;
             return query % C::NUM_PAGES;
         }
     };
 
     struct loader {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const int lane = kittens::laneid();
+            const int lane   = kittens::laneid();
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer     = inst[1];
             const int out_block = inst[2];
-            const int in_block = inst[3];
-
-            pipeline::wait_pages(s);
+            const int in_block  = inst[3];
 
             const int batch_tiles = div_up(g.batch_size, K_TILE);
+
             for (int kt = 0; kt < batch_tiles; ++kt) {
-                const int parity = kt & 1;
+                const int stage       = kt % pipeline::INPUT_PIPELINE_STAGES;
                 const int batch_start = kt * K_TILE;
+                const int loader_bit  = pipeline::loader_wait_bit(kt);
 
                 if (lane == 0) {
-                    kittens::tma::expect_bytes(pipeline::a_ready(s), sizeof(float) * K_TILE * N_TILE);
-                    kittens::tma::expect_bytes(pipeline::b_ready(s), sizeof(float) * K_TILE * N_TILE);
+                    kittens::wait(pipeline::a_finished(s, stage), loader_bit);
+                    kittens::wait(pipeline::b_finished(s, stage), loader_bit);
+
+                    if (kt < pipeline::INPUT_PIPELINE_STAGES) {
+                        s.wait_page_ready(pipeline::a_pid(s, stage));
+                        s.wait_page_ready(pipeline::b_pid(s, stage));
+                    }
+
+                    const size_t bytes = sizeof(float) * K_TILE * N_TILE;
+
+                    kittens::tma::expect_bytes(pipeline::a_arrived(s, stage), bytes);
+                    kittens::tma::expect_bytes(pipeline::b_arrived(s, stage), bytes);
 
                     // A tile: grad_out chunk (batch, out)
                     kittens::tma::load_async(
-                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::a_tile(s)),
+                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::a_tile(s, stage)),
                         g.grad_activations,
                         kittens::coord<>{layer + 1, 0, batch_start, out_block * N_TILE},
-                        pipeline::a_ready(s));
+                        pipeline::a_arrived(s, stage)
+                    );
 
                     // B tile: activations chunk (batch, in)
                     kittens::tma::load_async(
-                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)),
+                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s, stage)),
                         g.activations,
                         kittens::coord<>{layer, 0, batch_start, in_block * N_TILE},
-                        pipeline::b_ready(s));
+                        pipeline::b_arrived(s, stage)
+                    );
 
                     if (g.debug_vis) {
-                        printf("[bwd-w loader] layer=%d out_blk=%d in_blk=%d kt=%d\n", layer, out_block, in_block, kt);
+                        printf("[bwd-w loader] layer=%d out_blk=%d in_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                               layer, out_block, in_block, kt, stage,
+                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
                     }
                 }
 
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
                 __syncwarp();
             }
         }
@@ -393,9 +486,9 @@ struct LinearBwdWeight {
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer     = inst[1];
             const int out_block = inst[2];
-            const int in_block = inst[3];
+            const int in_block  = inst[3];
 
             const int batch_tiles = div_up(g.batch_size, K_TILE);
 
@@ -403,26 +496,50 @@ struct LinearBwdWeight {
             kittens::warp::zero(grad_tile);
 
             for (int kt = 0; kt < batch_tiles; ++kt) {
-                const int parity = kt & 1;
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
+                const int stage         = kt % pipeline::INPUT_PIPELINE_STAGES;
+                const int consumer_bit = pipeline::consumer_wait_bit(kt);
+
+                kittens::wait(pipeline::a_arrived(s, stage), consumer_bit);
+                kittens::wait(pipeline::b_arrived(s, stage), consumer_bit);
                 __syncwarp();
 
+                weight_frag_row_t grad_out_row;
+                weight_frag_row_t activ_row;
                 weight_frag_col_t grad_out_frag;
                 weight_frag_col_t activ_frag;
-                kittens::warp::load(grad_out_frag, reinterpret_cast<weight_tile_bwd_t &>(pipeline::a_tile(s)));
-                kittens::warp::load(activ_frag, reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)));
+
+                kittens::warp::load(
+                    grad_out_row,
+                    reinterpret_cast<weight_tile_bwd_t &>(pipeline::a_tile(s, stage))
+                );
+                kittens::warp::load(
+                    activ_row,
+                    reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s, stage))
+                );
+                kittens::warp::swap_layout(grad_out_frag, grad_out_row);
+                kittens::warp::swap_layout(activ_frag, activ_row);
 
                 kittens::warp::mma_AtB(grad_tile, grad_out_frag, activ_frag, grad_tile);
                 __syncwarp();
+
+                kittens::warp::arrive(pipeline::a_finished(s, stage));
+                kittens::warp::arrive(pipeline::b_finished(s, stage));
+
+                if (kt >= batch_tiles - pipeline::INPUT_PIPELINE_STAGES) {
+                    if (kittens::laneid() == 0) {
+                        s.warp_finish_page(pipeline::a_pid(s, stage), 1);
+                        s.warp_finish_page(pipeline::b_pid(s, stage), 1);
+                    }
+                }
             }
 
-            // store full tile into padded grad_w
             const float scale = 1.f / float(g.batch_size);
             kittens::warp::mul(grad_tile, grad_tile, scale);
-            kittens::warp::store(g.grad_w, grad_tile, kittens::coord<>{layer, 0, out_block * N_TILE, in_block * N_TILE});
-
-            pipeline::release_pages(s);
+            kittens::warp::store(
+                g.grad_w,
+                grad_tile,
+                kittens::coord<>{layer, 0, out_block * N_TILE, in_block * N_TILE}
+            );
         }
     };
 };
@@ -431,60 +548,78 @@ template <typename C = config>
 struct LinearBwdInput {
     static constexpr int opcode = OpCode::LINEAR_BWD_INPUT;
     using pipeline = two_page_pipeline<C, linear_training_globals>;
+    using state_t  = megakernel::state<C>;
 
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &s) {
             return pipeline::init_semaphores(s);
         }
-        static __device__ int release_lid(const linear_training_globals &, typename C::instruction_t &, int &query) {
-            if (query == 0) return pipeline::A_LID;
-            if (query == 1) return pipeline::B_LID;
+
+        static __device__ int release_lid(
+            const linear_training_globals &, typename C::instruction_t &, int &query
+        ) {
+            if (query == 0) return pipeline::A0_LID;
+            if (query == 1) return pipeline::A1_LID;
+            if (query == 2) return pipeline::B0_LID;
+            if (query == 3) return pipeline::B1_LID;
             return query % C::NUM_PAGES;
         }
     };
 
     struct loader {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
-            const int lane = kittens::laneid();
+            const int lane   = kittens::laneid();
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer   = inst[1];
             const int m_block = inst[2]; // batch tile
             const int n_block = inst[3]; // input tile
 
-            pipeline::wait_pages(s);
-
-            const int out_dim = get_out_dim(g, layer);
-            const int k_tiles = div_up(out_dim, K_TILE);
+            const int out_dim  = get_out_dim(g, layer);
+            const int k_tiles  = div_up(out_dim, K_TILE);
 
             for (int kt = 0; kt < k_tiles; ++kt) {
-                const int parity = kt & 1;
-                const int k_start = kt * K_TILE;
+                const int stage       = kt % pipeline::INPUT_PIPELINE_STAGES;
+                const int k_start     = kt * K_TILE;
+                const int loader_bit  = pipeline::loader_wait_bit(kt);
 
                 if (lane == 0) {
-                    kittens::tma::expect_bytes(pipeline::a_ready(s), sizeof(float) * M_TILE * K_TILE);
-                    kittens::tma::expect_bytes(pipeline::b_ready(s), sizeof(float) * K_TILE * N_TILE);
+                    kittens::wait(pipeline::a_finished(s, stage), loader_bit);
+                    kittens::wait(pipeline::b_finished(s, stage), loader_bit);
+
+                    if (kt < pipeline::INPUT_PIPELINE_STAGES) {
+                        s.wait_page_ready(pipeline::a_pid(s, stage));
+                        s.wait_page_ready(pipeline::b_pid(s, stage));
+                    }
+
+                    const size_t bytes_a = sizeof(float) * M_TILE * K_TILE;
+                    const size_t bytes_b = sizeof(float) * N_TILE * K_TILE;
+
+                    kittens::tma::expect_bytes(pipeline::a_arrived(s, stage), bytes_a);
+                    kittens::tma::expect_bytes(pipeline::b_arrived(s, stage), bytes_b);
 
                     // A tile: grad_out (batch, out_dim)
                     kittens::tma::load_async(
-                        pipeline::a_tile(s),
+                        pipeline::a_tile(s, stage),
                         g.grad_activations,
                         kittens::coord<>{layer + 1, 0, m_block * M_TILE, k_start},
-                        pipeline::a_ready(s));
+                        pipeline::a_arrived(s, stage)
+                    );
 
                     // B tile: weights (out_dim, in_dim)
                     kittens::tma::load_async(
-                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)),
+                        reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s, stage)),
                         g.weights,
                         kittens::coord<>{layer, 0, k_start, n_block * N_TILE},
-                        pipeline::b_ready(s));
+                        pipeline::b_arrived(s, stage)
+                    );
 
                     if (g.debug_vis) {
-                        printf("[bwd-in loader] layer=%d m_blk=%d n_blk=%d kt=%d\n", layer, m_block, n_block, kt);
+                        printf("[bwd-in loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                               layer, m_block, n_block, kt, stage,
+                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
                     }
                 }
 
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
                 __syncwarp();
             }
         }
@@ -508,40 +643,59 @@ struct LinearBwdInput {
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
             const auto &inst = s.instruction();
-            const int layer = inst[1];
+            const int layer   = inst[1];
             const int m_block = inst[2];
             const int n_block = inst[3];
 
-            const int out_dim = get_out_dim(g, layer);
-            const int k_tiles = div_up(out_dim, K_TILE);
+            const int out_dim  = get_out_dim(g, layer);
+            const int k_tiles  = div_up(out_dim, K_TILE);
 
             output_frag_t grad_frag;
             kittens::warp::zero(grad_frag);
 
             for (int kt = 0; kt < k_tiles; ++kt) {
-                const int parity = kt & 1;
-                kittens::wait(pipeline::a_ready(s), parity);
-                kittens::wait(pipeline::b_ready(s), parity);
+                const int stage         = kt % pipeline::INPUT_PIPELINE_STAGES;
+                const int consumer_bit  = pipeline::consumer_wait_bit(kt);
+
+                kittens::wait(pipeline::a_arrived(s, stage), consumer_bit);
+                kittens::wait(pipeline::b_arrived(s, stage), consumer_bit);
                 __syncwarp();
 
-                activ_frag_t grad_out_frag;
-                weight_frag_col_t weight_frag;
-                kittens::warp::load(grad_out_frag, pipeline::a_tile(s));
-                kittens::warp::load(weight_frag, reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)));
+                activ_frag_t       grad_out_frag;
+                weight_frag_col_t  w_col;
 
-                kittens::warp::mma_AB(grad_frag, grad_out_frag, weight_frag, grad_frag);
+                // grad_out tile: (M_TILE x K_TILE), row layout
+                kittens::warp::load(grad_out_frag, pipeline::a_tile(s, stage));
+                // weights tile: [K_TILE x N_TILE], column layout.
+                kittens::warp::load(
+                    w_col,
+                    reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s, stage))
+                );
+
+                // grad_in = grad_out @ W, where W is (out_dim x in_dim) and this tile is (K_TILE x N_TILE)
+                kittens::warp::mma_AB(grad_frag, grad_out_frag, w_col, grad_frag);
                 __syncwarp();
+
+                kittens::warp::arrive(pipeline::a_finished(s, stage));
+                kittens::warp::arrive(pipeline::b_finished(s, stage));
+
+                if (kt >= k_tiles - pipeline::INPUT_PIPELINE_STAGES) {
+                    if (kittens::laneid() == 0) {
+                        s.warp_finish_page(pipeline::a_pid(s, stage), 1);
+                        s.warp_finish_page(pipeline::b_pid(s, stage), 1);
+                    }
+                }
             }
 
             kittens::warp::store(
                 g.grad_activations,
                 grad_frag,
-                kittens::coord<>{layer, 0, m_block * M_TILE, n_block * N_TILE});
-
-            pipeline::release_pages(s);
+                kittens::coord<>{layer, 0, m_block * M_TILE, n_block * N_TILE}
+            );
         }
     };
 };
+
 
 template <typename C = config>
 struct SgdUpdate {
@@ -573,6 +727,13 @@ struct SgdUpdate {
 
     struct consumer {
         static __device__ void run(const linear_training_globals &g, state_t &s) {
+            // Only a single consumer warp should apply sgd updates.
+            // Other consumer warps are effectively no-ops for this instruction.
+            // TODO: think about this?
+            if (kittens::warpid() != 0) {
+                return;
+            }
+
             const auto &inst = s.instruction();
             const int layer = inst[1];
             const int out_block = inst[2];
@@ -591,7 +752,17 @@ struct SgdUpdate {
                 if (row < out_dim && col < in_dim) {
                     float w = g.weights[{layer, 0, row, col}];
                     float grad = g.grad_w[{layer, 0, row, col}];
-                    g.weights[{layer, 0, row, col}] = w - g.lr * grad;
+                    float w_new = w - g.lr * grad;
+                    g.weights[{layer, 0, row, col}] = w_new;
+
+                    // Single element to check sgd math against host: layer 0, row=1, col=2
+                    // Not gating on laneid==0, bc different lanes handle different (row, col) pairs
+                    if (g.debug_vis && layer == 0 && row == 1 && col == 2) {
+                        printf(
+                            "[sgd-debug] layer=%d row=%d col=%d w_before=%f grad=%f lr=%f w_after=%f\n",
+                            layer, row, col, w, grad, g.lr, w_new
+                        );
+                    }
                 }
             }
 

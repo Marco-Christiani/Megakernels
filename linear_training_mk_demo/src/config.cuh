@@ -36,7 +36,7 @@ struct linear_training_mk_demo_config {
         MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
 
     // Shared memory declared dynamically
-    static constexpr int PAGE_SIZE = 16384;
+    static constexpr int PAGE_SIZE = 8192;
     static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
     static_assert(NUM_PAGES >= 1, "NUM_PAGES must be >= 1");
 
