@@ -11,7 +11,7 @@
 #include <iostream>
 #include <vector>
 
-// Tile geometry for all MMA paths.
+// Tile geometry for all MMA paths
 constexpr int M_TILE = 16;
 constexpr int N_TILE = 16;
 constexpr int K_TILE = 16;
@@ -22,6 +22,7 @@ using weight_tile_bwd_t = kittens::st_fl<K_TILE, N_TILE>;   // weights/activatio
 using output_frag_t = kittens::rt_fl<M_TILE, N_TILE>;
 using activ_frag_t = kittens::rt_bf<M_TILE, K_TILE>;
 using weight_frag_fwd_t = kittens::rt_bf<N_TILE, K_TILE>;
+using weight_frag_row_t = kittens::rt_bf<K_TILE, N_TILE>;
 using weight_frag_col_t = kittens::rt_bf<K_TILE, N_TILE, kittens::ducks::rt_layout::col>;
 
 using config = linear_training_mk_demo_config;
@@ -43,15 +44,14 @@ struct linear_training_globals {
     using instruction_layout = megakernel::instruction_layout<config>;
     using timing_layout = megakernel::timing_layout<config>;
 
-    // Layouts:
-    // activations / grad_activations: [layer, 1, batch, dim]
-    using activations_t = kittens::gl<float, -1, 1, -1, -1, activ_tile_t>;
-    // weights / grad_w: [layer, 1, out_dim, in_dim]
-    using weights_t = kittens::gl<float, -1, 1, -1, -1, weight_tile_fwd_t>;
+    // activations / grad_activations: (layer, 1, batch, dim)
+    using activations_t = kittens::gl<float, -1, 1, -1, -1, activ_tile_t, weight_tile_bwd_t>;
+    // weights / grad_w: (layer, 1, out_dim, in_dim)
+    using weights_t = kittens::gl<float, -1, 1, -1, -1, weight_tile_fwd_t, weight_tile_bwd_t>;
     using grad_w_t = kittens::gl<float, -1, 1, -1, -1>;
-    // targets: [1, 1, batch, dim]
+    // targets: (1, 1, batch, dim)
     using targets_t = kittens::gl<float, 1, 1, -1, -1>;
-    // dims arrays: [1, 1, 1, num_layers]
+    // dims arrays: (1, 1, 1, num_layers)
     using dims_t = kittens::gl<int, 1, 1, 1, -1>;
 
     instruction_layout instructions;
@@ -188,7 +188,7 @@ struct LinearFwd {
                     }
                 }
 
-                // Ensure data is visible before consumers advance.
+                // make sure data is visible before consumers advance
                 kittens::wait(pipeline::a_ready(s), parity);
                 kittens::wait(pipeline::b_ready(s), parity);
                 __syncwarp();
@@ -242,7 +242,7 @@ struct LinearFwd {
                 __syncwarp();
             }
 
-            // Store full tile; padding guarantees bounds.
+            // store full tile, padding guarantees bounds
             kittens::warp::store(g.activations, c_frag, kittens::coord<>{layer + 1, 0, m_start, n_start});
 
             if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
@@ -349,14 +349,14 @@ struct LinearBwdWeight {
                     kittens::tma::expect_bytes(pipeline::a_ready(s), sizeof(float) * K_TILE * N_TILE);
                     kittens::tma::expect_bytes(pipeline::b_ready(s), sizeof(float) * K_TILE * N_TILE);
 
-                    // A tile: grad_out chunk [batch, out]
+                    // A tile: grad_out chunk (batch, out)
                     kittens::tma::load_async(
                         reinterpret_cast<weight_tile_bwd_t &>(pipeline::a_tile(s)),
                         g.grad_activations,
                         kittens::coord<>{layer + 1, 0, batch_start, out_block * N_TILE},
                         pipeline::a_ready(s));
 
-                    // B tile: activations chunk [batch, in]
+                    // B tile: activations chunk (batch, in)
                     kittens::tma::load_async(
                         reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)),
                         g.activations,
@@ -370,7 +370,7 @@ struct LinearBwdWeight {
 
                 kittens::wait(pipeline::a_ready(s), parity);
                 kittens::wait(pipeline::b_ready(s), parity);
-                __syncthreads();
+                __syncwarp();
             }
         }
     };
@@ -417,7 +417,7 @@ struct LinearBwdWeight {
                 __syncwarp();
             }
 
-            // Store full tile into padded grad_w.
+            // store full tile into padded grad_w
             const float scale = 1.f / float(g.batch_size);
             kittens::warp::mul(grad_tile, grad_tile, scale);
             kittens::warp::store(g.grad_w, grad_tile, kittens::coord<>{layer, 0, out_block * N_TILE, in_block * N_TILE});
@@ -464,14 +464,14 @@ struct LinearBwdInput {
                     kittens::tma::expect_bytes(pipeline::a_ready(s), sizeof(float) * M_TILE * K_TILE);
                     kittens::tma::expect_bytes(pipeline::b_ready(s), sizeof(float) * K_TILE * N_TILE);
 
-                    // A tile: grad_out [batch, out_dim]
+                    // A tile: grad_out (batch, out_dim)
                     kittens::tma::load_async(
                         pipeline::a_tile(s),
                         g.grad_activations,
                         kittens::coord<>{layer + 1, 0, m_block * M_TILE, k_start},
                         pipeline::a_ready(s));
 
-                    // B tile: weights [out_dim, in_dim]
+                    // B tile: weights (out_dim, in_dim)
                     kittens::tma::load_async(
                         reinterpret_cast<weight_tile_bwd_t &>(pipeline::b_tile(s)),
                         g.weights,
@@ -485,7 +485,7 @@ struct LinearBwdInput {
 
                 kittens::wait(pipeline::a_ready(s), parity);
                 kittens::wait(pipeline::b_ready(s), parity);
-                __syncthreads();
+                __syncwarp();
             }
         }
     };
@@ -617,11 +617,11 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
     TORCH_CHECK(input.scalar_type() == torch::kFloat, "input must be float32");
     TORCH_CHECK(target.scalar_type() == torch::kFloat, "target must be float32");
     TORCH_CHECK(weights.scalar_type() == torch::kFloat, "weights must be float32");
-    TORCH_CHECK(instructions_tensor.dim() == 3, "instructions must be [sm_count, num_instructions, 32]");
+    TORCH_CHECK(instructions_tensor.dim() == 3, "instructions must be (sm_count, num_instructions, 32)");
     TORCH_CHECK(instructions_tensor.size(2) == config::INSTRUCTION_WIDTH,
                 "expected instruction width ", config::INSTRUCTION_WIDTH);
 
-    TORCH_CHECK(weights.dim() == 3, "weights must be [layers, out_dim, in_dim]");
+    TORCH_CHECK(weights.dim() == 3, "weights must be (layers, out_dim, in_dim)");
     const int num_layers = weights.size(0);
     TORCH_CHECK(num_layers > 0, "weights must contain at least one layer");
 
@@ -647,14 +647,14 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
     const int padded_out_dim = div_up(max_out_dim, N_TILE) * N_TILE;
     const int max_dim = std::max(padded_in_dim, padded_out_dim);
 
-    // Padded activations/grad buffers
+    // padded activations/grad buffers
     auto activations = torch::zeros({num_layers + 1, 1, padded_batch, max_dim}, input.options());
     auto grad_activations = torch::zeros_like(activations);
 
-    // Copy input into activation[0]
+    // copy input into activation[0]
     activations.index_put_({0, 0, torch::indexing::Slice(0, batch_size), torch::indexing::Slice(0, layer_in_dims.front())}, input);
 
-    // Padded weights/grad_w
+    // padded weights/grad_w
     auto weights_padded = torch::zeros({num_layers, 1, padded_out_dim, padded_in_dim}, weights.options());
     weights_padded.index_put_(
         {torch::indexing::Slice(), torch::indexing::Slice(0, 1),
@@ -663,7 +663,7 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         weights.unsqueeze(1));
     auto grad_w = torch::zeros_like(weights_padded);
 
-    // Targets padded
+    // padded targets
     auto targets = torch::zeros({1, 1, padded_batch, max_dim}, target.options());
     targets.index_put_({0, 0, torch::indexing::Slice(0, batch_size), torch::indexing::Slice(0, layer_out_dims.back())}, target);
 
@@ -780,7 +780,7 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
     std::cout << "[linear-training host] kernel completed err=" << cudaGetErrorString(err) << std::endl;
     TORCH_CHECK(err == cudaSuccess, "linear training kernel launch failed: ", cudaGetErrorString(err));
 
-    // Slice outputs to the user-facing shapes.
+    // slice outputs to the user-facing shapes
     auto output = activations.index({num_layers, 0, torch::indexing::Slice(0, batch_size),
                                      torch::indexing::Slice(0, layer_out_dims.back())}).contiguous();
     auto grad_out = grad_activations.index({num_layers, 0, torch::indexing::Slice(0, batch_size),
@@ -794,7 +794,7 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
                                               torch::indexing::Slice(0, layer_out_dims.back()),
                                               torch::indexing::Slice(0, layer_in_dims.front())}).contiguous();
 
-    // Propagate updated weights back to the caller-provided tensor.
+    // write back updated weights to user tensor
     weights.copy_(weights_view);
 
     return {output, grad_out, grad_input, grad_w_view, weights_view, timings};
