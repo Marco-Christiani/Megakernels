@@ -41,6 +41,8 @@ struct linear_training_mk_demo_config {
     static_assert(NUM_PAGES >= 1, "NUM_PAGES must be >= 1");
 
     static constexpr bool TIMING_RECORD_ENABLED = false;
+    static constexpr bool DEBUG_VIS_ENABLED = false;
+    static constexpr bool HOST_DEBUG_LOG = false;
 
     static constexpr int CONSUMER_REGISTERS = 104;
     static constexpr int NON_CONSUMER_REGISTERS = 64;

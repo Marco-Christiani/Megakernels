@@ -41,12 +41,13 @@ def matmul_bf16(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b_bf = b.to(torch.bfloat16).to(torch.float32)
     return a_bf @ b_bf  # fp32 matmul on bf16-quantized values
 
-
+# BEGIN_REF: linear_forward_bf16
 def linear_forward_bf16(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     """y = x @ W.T, returning fp32."""
     return matmul_bf16(x, W.transpose(-1, -2))
+# END_REF: linear_forward_bf16
 
-
+# BEGIN_REF: linear_backward_bf16
 def linear_backward_bf16(
     x: torch.Tensor, W: torch.Tensor, grad_out: torch.Tensor, batch: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -58,6 +59,7 @@ def linear_backward_bf16(
     grad_w = matmul_bf16(grad_out.transpose(-1, -2), x) / batch
     grad_in = matmul_bf16(grad_out, W)
     return grad_in, grad_w
+# END_REF: linear_backward_bf16
 
 
 def tile_range(length: int, tile: int) -> range:
@@ -117,15 +119,19 @@ def build_single_queue(batch: int, in_dim: int, out_dim: int, num_layers: int, d
     return torch.tensor(insts, device=device, dtype=torch.int32)
 
 
-@inference_mode()
-def build_instructions(device: torch.device, sm_count: int, batch: int) -> torch.Tensor:
-    per_sm_insts = build_single_queue(batch, IN_DIM, OUT_DIM, NUM_LAYERS, device)
-    expanded = (
+def _shard_instructions(per_sm_insts: torch.Tensor, sm_count: int, device: torch.device) -> torch.Tensor:
+    # Replicate the instruction queue across SMs (one queue per block).
+    return (
         per_sm_insts.unsqueeze(0)
         .expand(sm_count, per_sm_insts.size(0), per_sm_insts.size(1))
         .contiguous()
     )
-    return expanded
+
+
+@inference_mode()
+def build_instructions(device: torch.device, sm_count: int, batch: int) -> torch.Tensor:
+    per_sm_insts = build_single_queue(batch, IN_DIM, OUT_DIM, NUM_LAYERS, device)
+    return _shard_instructions(per_sm_insts, sm_count, device)
 
 
 def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
@@ -154,19 +160,25 @@ def run_demo_step(batch: int = 4, lr: float = 0.05, debug: bool = False):
         out_ref = activations[-1]
 
         grad_acts: list[torch.Tensor | None] = [None] * (NUM_LAYERS + 1)
+        # BEGIN_REF: loss_grad_manual
         grad_acts[-1] = 2.0 * (out_ref - target) / batch
+        # END_REF: loss_grad_manual
 
         grad_w_ref = torch.zeros_like(weights_ref)
         for l in reversed(range(NUM_LAYERS)):
+            # BEGIN_REF: linear_backward_weight_input_manual
             grad_in_l, grad_w_l = linear_backward_bf16(
                 activations[l], weights_ref[l], grad_acts[l + 1], batch
             )
             grad_acts[l] = grad_in_l
             grad_w_ref[l] = grad_w_l
+            # END_REF: linear_backward_weight_input_manual
 
         grad_out_ref = grad_acts[-1]
         grad_in_ref = grad_acts[0]
+        # BEGIN_REF: sgd_update_manual
         weights_ref_updated = weights_ref - lr * grad_w_ref
+        # END_REF: sgd_update_manual
 
     elif REF_MODE == "bf16_autograd":
         x_bf = x.to(torch.bfloat16).detach().requires_grad_(True)
@@ -295,11 +307,13 @@ def test_linear_training_matches_torch():
     weights = results["weights"]
     refs = results["refs"]
 
+    # BEGIN_REF: main_assertions
     assert torch.allclose(out, refs["out"], atol=1e-3, rtol=1e-3)
     assert torch.allclose(grad_out, refs["grad_out"], atol=1e-3, rtol=1e-3)
     assert torch.allclose(grad_in, refs["grad_in"], atol=1e-3, rtol=1e-3)
     assert torch.allclose(grad_w, refs["grad_w"], atol=1e-3, rtol=1e-3)
     assert torch.allclose(weights, refs["weights"], atol=1e-3, rtol=1e-3)
+    # END_REF: main_assertions
 
 
 def test_linear_training_bf16_trains_down_loss():
@@ -354,7 +368,9 @@ def test_linear_training_bf16_trains_down_loss():
         losses.append(loss.item())
 
     # Require that training actually reduces loss over time.
+    # BEGIN_REF: loss_assert
     assert losses[-1] < losses[0], f"bf16-style training did not reduce loss {losses}"
+    # END_REF: loss_assert
 
 def main():
     debug_vis = env_flag("LINEAR_DEMO_DEBUG")

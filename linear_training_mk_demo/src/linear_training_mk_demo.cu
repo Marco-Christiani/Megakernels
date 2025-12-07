@@ -70,7 +70,7 @@ struct linear_training_globals {
     int num_layers;
     int debug_vis;
 
-    dim3 grid() const { return dim3(1); }
+    dim3 grid() const { return dim3(config::NUM_BLOCKS); }
     dim3 block() const { return dim3(config::NUM_THREADS); }
     int dynamic_shared_memory() const { return config::DYNAMIC_SHARED_MEMORY; }
 };
@@ -243,10 +243,12 @@ struct LinearFwd {
                         pipeline::b_arrived(s, stage)
                     );
 
-                    if (g.debug_vis) {
-                        printf("[fwd-loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
-                               layer, m_block, n_block, kt, stage,
-                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                    if constexpr (config::DEBUG_VIS_ENABLED) {
+                        if (g.debug_vis) {
+                            printf("[fwd-loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                                   layer, m_block, n_block, kt, stage,
+                                   pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                        }
                     }
                 }
 
@@ -321,9 +323,11 @@ struct LinearFwd {
                 kittens::coord<>{layer + 1, 0, m_start, n_start}
             );
 
-            if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
-                printf("[fwd-consumer] layer=%d m_blk=%d n_blk=%d wrote tile\n",
-                       layer, m_block, n_block);
+            if constexpr (config::DEBUG_VIS_ENABLED) {
+                if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
+                    printf("[fwd-consumer] layer=%d m_blk=%d n_blk=%d wrote tile\n",
+                           layer, m_block, n_block);
+                }
             }
         }
     };
@@ -332,6 +336,8 @@ struct LinearFwd {
 template <typename C = config>
 struct LossGrad {
     static constexpr int opcode = OpCode::LOSS_GRAD;
+    // This op does not touch page_finished, parity safety currently relies on
+    // reaching it with an even instruction count between page-using ops.
 
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &) { return 0; }
@@ -341,7 +347,16 @@ struct LossGrad {
     };
 
     struct loader {
-        static __device__ void run(const linear_training_globals &, state_t &) {}
+        static __device__ void run(const linear_training_globals &, state_t &s) {
+            // This op doesnt use pages, but wait_page_ready derives parity from instruction_index.
+            // Without advancing page mbarriers here later page-using ops can deadlock when the
+            // instruction count parity and page_finished parity diverge (eg odd number of page-free ops).
+            if (kittens::laneid() < C::NUM_PAGES) {
+                auto pid = s.pid(kittens::laneid());
+                s.wait_page_ready(pid);
+                s.finish_page(pid, C::NUM_CONSUMER_WARPS);
+            }
+        }
     };
 
     struct launcher {
@@ -382,8 +397,10 @@ struct LossGrad {
                 }
             }
 
-            if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
-                printf("[lossgrad] layer=%d m_blk=%d n_blk=%d\n", layer, m_block, n_block);
+            if constexpr (config::DEBUG_VIS_ENABLED) {
+                if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
+                    printf("[lossgrad] layer=%d m_blk=%d n_blk=%d\n", layer, m_block, n_block);
+                }
             }
         }
     };
@@ -456,10 +473,12 @@ struct LinearBwdWeight {
                         pipeline::b_arrived(s, stage)
                     );
 
-                    if (g.debug_vis) {
-                        printf("[bwd-w loader] layer=%d out_blk=%d in_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
-                               layer, out_block, in_block, kt, stage,
-                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                    if constexpr (config::DEBUG_VIS_ENABLED) {
+                        if (g.debug_vis) {
+                            printf("[bwd-w loader] layer=%d out_blk=%d in_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                                   layer, out_block, in_block, kt, stage,
+                                   pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                        }
                     }
                 }
 
@@ -613,10 +632,12 @@ struct LinearBwdInput {
                         pipeline::b_arrived(s, stage)
                     );
 
-                    if (g.debug_vis) {
-                        printf("[bwd-in loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
-                               layer, m_block, n_block, kt, stage,
-                               pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                    if constexpr (config::DEBUG_VIS_ENABLED) {
+                        if (g.debug_vis) {
+                            printf("[bwd-in loader] layer=%d m_blk=%d n_blk=%d kt=%d stage=%d pidA=%d pidB=%d\n",
+                                   layer, m_block, n_block, kt, stage,
+                                   pipeline::a_pid(s, stage), pipeline::b_pid(s, stage));
+                        }
                     }
                 }
 
@@ -700,6 +721,8 @@ struct LinearBwdInput {
 template <typename C = config>
 struct SgdUpdate {
     static constexpr int opcode = OpCode::SGD_UPDATE;
+    // This op does not claim/release pages. If instruction ordering changes, an
+    // odd count of page-free ops between page users can deadlock parity waits.
 
     struct controller {
         static __device__ int init_semaphores(const linear_training_globals &, state_t &) { return 0; }
@@ -709,7 +732,16 @@ struct SgdUpdate {
     };
 
     struct loader {
-        static __device__ void run(const linear_training_globals &, state_t &) {}
+        static __device__ void run(const linear_training_globals &, state_t &s) {
+            // This op doesnt touch pages, we still need to advance parity in page_finished so page
+            // users in later instructions dont block on a never-issued arrive when instruction_index
+             parity flips.
+            if (kittens::laneid() < C::NUM_PAGES) {
+                auto pid = s.pid(kittens::laneid());
+                s.wait_page_ready(pid);
+                s.finish_page(pid, C::NUM_CONSUMER_WARPS);
+            }
+        }
     };
 
     struct launcher {
@@ -757,17 +789,21 @@ struct SgdUpdate {
 
                     // Single element to check sgd math against host: layer 0, row=1, col=2
                     // Not gating on laneid==0, bc different lanes handle different (row, col) pairs
-                    if (g.debug_vis && layer == 0 && row == 1 && col == 2) {
-                        printf(
-                            "[sgd-debug] layer=%d row=%d col=%d w_before=%f grad=%f lr=%f w_after=%f\n",
-                            layer, row, col, w, grad, g.lr, w_new
-                        );
+                    if constexpr (config::DEBUG_VIS_ENABLED) {
+                        if (g.debug_vis && layer == 0 && row == 1 && col == 2) {
+                            printf(
+                                "[sgd-debug] layer=%d row=%d col=%d w_before=%f grad=%f lr=%f w_after=%f\n",
+                                layer, row, col, w, grad, g.lr, w_new
+                            );
+                        }
                     }
                 }
             }
 
-            if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
-                printf("[sgd] layer=%d out_blk=%d in_blk=%d\n", layer, out_block, in_block);
+            if constexpr (config::DEBUG_VIS_ENABLED) {
+                if (g.debug_vis && kittens::laneid() == 0 && kittens::warpid() == 0) {
+                    printf("[sgd] layer=%d out_blk=%d in_blk=%d\n", layer, out_block, in_block);
+                }
             }
         }
     };
@@ -843,7 +879,7 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         torch::TensorOptions().dtype(torch::kInt32).device(instructions_tensor.device()));
 
     typename linear_training_globals::instruction_layout inst_layout =
-        kittens::make_gl<typename linear_training_globals::instruction_layout>(
+        kittens::make_gl<typename linear_training_globals::instruction_layout, false>(
             reinterpret_cast<uint64_t>(instructions_tensor.data_ptr<int>()),
             1,
             static_cast<int>(instructions_tensor.size(0)),
@@ -934,10 +970,14 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         num_layers,
         debug_vis ? 1 : 0};
 
-    std::cout << "[linear-training host] launching kernel with batch_size=" << batch_size
-              << " lr=" << lr
-              << " layers=" << num_layers
-              << " debug=" << (debug_vis ? "true" : "false") << std::endl;
+    if constexpr (config::HOST_DEBUG_LOG) {
+        if (debug_vis) {
+            std::cout << "[linear-training host] launching kernel with batch_size=" << batch_size
+                      << " lr=" << lr
+                      << " layers=" << num_layers
+                      << " debug=" << (debug_vis ? "true" : "false") << std::endl;
+        }
+    }
 
     megakernel::mk<config,
                    linear_training_globals,
@@ -948,7 +988,11 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
                    SgdUpdate<config>><<<g.grid(), g.block(), g.dynamic_shared_memory()>>>(g);
 
     cudaError_t err = cudaDeviceSynchronize();
-    std::cout << "[linear-training host] kernel completed err=" << cudaGetErrorString(err) << std::endl;
+    if constexpr (config::HOST_DEBUG_LOG) {
+        if (debug_vis) {
+            std::cout << "[linear-training host] kernel completed err=" << cudaGetErrorString(err) << std::endl;
+        }
+    }
     TORCH_CHECK(err == cudaSuccess, "linear training kernel launch failed: ", cudaGetErrorString(err));
 
     // slice outputs to the user-facing shapes
@@ -971,6 +1015,232 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
     return {output, grad_out, grad_input, grad_w_view, weights_view, timings};
 }
 
+void run_linear_training_inplace(torch::Tensor instructions_tensor,
+                                 torch::Tensor activations,
+                                 torch::Tensor grad_activations,
+                                 torch::Tensor weights_padded,
+                                 torch::Tensor grad_w,
+                                 torch::Tensor targets,
+                                 torch::Tensor in_dim_tensor,
+                                 torch::Tensor out_dim_tensor,
+                                 int batch_size,
+                                 double lr,
+                                 bool debug_vis) {
+    CHECK_INPUT(instructions_tensor);
+    CHECK_INPUT(activations);
+    CHECK_INPUT(grad_activations);
+    CHECK_INPUT(weights_padded);
+    CHECK_INPUT(grad_w);
+    CHECK_INPUT(targets);
+    CHECK_INPUT(in_dim_tensor);
+    CHECK_INPUT(out_dim_tensor);
+
+    TORCH_CHECK(instructions_tensor.scalar_type() == torch::kInt32, "instructions must be int32");
+    TORCH_CHECK(activations.scalar_type() == torch::kFloat, "activations must be float32");
+    TORCH_CHECK(grad_activations.scalar_type() == torch::kFloat, "grad_activations must be float32");
+    TORCH_CHECK(weights_padded.scalar_type() == torch::kFloat, "weights must be float32");
+    TORCH_CHECK(grad_w.scalar_type() == torch::kFloat, "grad_w must be float32");
+    TORCH_CHECK(targets.scalar_type() == torch::kFloat, "targets must be float32");
+    TORCH_CHECK(in_dim_tensor.scalar_type() == torch::kInt32, "in_dim_tensor must be int32");
+    TORCH_CHECK(out_dim_tensor.scalar_type() == torch::kInt32, "out_dim_tensor must be int32");
+
+    const int num_layers = static_cast<int>(weights_padded.size(0));
+    TORCH_CHECK(num_layers > 0, "weights must contain at least one layer");
+    TORCH_CHECK(
+        activations.dim() == 4 && activations.size(0) == num_layers + 1 && activations.size(1) == 1,
+        "activations must be [num_layers+1, 1, padded_batch, max_dim]"
+    );
+    TORCH_CHECK(
+        grad_activations.sizes() == activations.sizes(),
+        "grad_activations must match activations shape"
+    );
+    TORCH_CHECK(
+        weights_padded.dim() == 4 && weights_padded.size(1) == 1,
+        "weights_padded must be [num_layers, 1, padded_out, padded_in]"
+    );
+    TORCH_CHECK(
+        grad_w.sizes() == weights_padded.sizes(),
+        "grad_w must match weights_padded shape"
+    );
+    TORCH_CHECK(
+        targets.dim() == 4 && targets.size(0) == 1 && targets.size(1) == 1,
+        "targets must be [1, 1, padded_batch, max_dim]"
+    );
+    TORCH_CHECK(
+        instructions_tensor.dim() == 3 && instructions_tensor.size(2) == config::INSTRUCTION_WIDTH,
+        "instructions must be (sm_count, num_instructions, 32)"
+    );
+
+    auto timings = torch::zeros(
+        {instructions_tensor.size(0), instructions_tensor.size(1), config::TIMING_WIDTH},
+        torch::TensorOptions().dtype(torch::kInt32).device(instructions_tensor.device()));
+
+    const int padded_batch = static_cast<int>(activations.size(2));
+    const int max_dim = static_cast<int>(activations.size(3));
+
+    typename linear_training_globals::instruction_layout inst_layout =
+        kittens::make_gl<typename linear_training_globals::instruction_layout>(
+            reinterpret_cast<uint64_t>(instructions_tensor.data_ptr<int>()),
+            1,
+            static_cast<int>(instructions_tensor.size(0)),
+            static_cast<int>(instructions_tensor.size(1)),
+            static_cast<int>(instructions_tensor.size(2)));
+
+    typename linear_training_globals::timing_layout timing_layout =
+        kittens::make_gl<typename linear_training_globals::timing_layout>(
+            reinterpret_cast<uint64_t>(timings.data_ptr<int>()),
+            1,
+            static_cast<int>(timings.size(0)),
+            static_cast<int>(timings.size(1)),
+            static_cast<int>(timings.size(2)));
+
+    typename linear_training_globals::activations_t activ_layout =
+        kittens::make_gl<typename linear_training_globals::activations_t>(
+            reinterpret_cast<uint64_t>(activations.data_ptr<float>()),
+            num_layers + 1,
+            1,
+            padded_batch,
+            max_dim);
+
+    typename linear_training_globals::activations_t grad_activ_layout =
+        kittens::make_gl<typename linear_training_globals::activations_t>(
+            reinterpret_cast<uint64_t>(grad_activations.data_ptr<float>()),
+            num_layers + 1,
+            1,
+            padded_batch,
+            max_dim);
+
+    typename linear_training_globals::weights_t weights_layout =
+        kittens::make_gl<typename linear_training_globals::weights_t>(
+            reinterpret_cast<uint64_t>(weights_padded.data_ptr<float>()),
+            num_layers,
+            1,
+            static_cast<int>(weights_padded.size(2)),
+            static_cast<int>(weights_padded.size(3)));
+
+    typename linear_training_globals::grad_w_t grad_w_layout =
+        kittens::make_gl<typename linear_training_globals::grad_w_t>(
+            reinterpret_cast<uint64_t>(grad_w.data_ptr<float>()),
+            num_layers,
+            1,
+            static_cast<int>(grad_w.size(2)),
+            static_cast<int>(grad_w.size(3)));
+
+    typename linear_training_globals::targets_t targets_layout =
+        kittens::make_gl<typename linear_training_globals::targets_t>(
+            reinterpret_cast<uint64_t>(targets.data_ptr<float>()),
+            1,
+            1,
+            static_cast<int>(targets.size(2)),
+            static_cast<int>(targets.size(3)));
+
+    typename linear_training_globals::dims_t in_dims_layout =
+        kittens::make_gl<typename linear_training_globals::dims_t>(
+            reinterpret_cast<uint64_t>(in_dim_tensor.data_ptr<int>()),
+            1,
+            1,
+            1,
+            static_cast<int>(in_dim_tensor.numel()));
+
+    typename linear_training_globals::dims_t out_dims_layout =
+        kittens::make_gl<typename linear_training_globals::dims_t>(
+            reinterpret_cast<uint64_t>(out_dim_tensor.data_ptr<int>()),
+            1,
+            1,
+            1,
+            static_cast<int>(out_dim_tensor.numel()));
+
+    linear_training_globals g{
+        inst_layout,
+        timing_layout,
+        activ_layout,
+        grad_activ_layout,
+        weights_layout,
+        grad_w_layout,
+        targets_layout,
+        in_dims_layout,
+        out_dims_layout,
+        static_cast<float>(lr),
+        batch_size,
+        padded_batch,
+        max_dim,
+        num_layers,
+        debug_vis ? 1 : 0};
+
+    megakernel::mk<config,
+                   linear_training_globals,
+                   LinearFwd<config>,
+                   LossGrad<config>,
+                   LinearBwdWeight<config>,
+                   LinearBwdInput<config>,
+                   SgdUpdate<config>><<<g.grid(), g.block(), g.dynamic_shared_memory()>>>(g);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "linear training kernel launch failed: ", cudaGetErrorString(err));
+}
+
+double run_linear_training_inplace_timed(torch::Tensor instructions_tensor,
+                                         torch::Tensor activations,
+                                         torch::Tensor grad_activations,
+                                         torch::Tensor weights_padded,
+                                         torch::Tensor grad_w,
+                                         torch::Tensor targets,
+                                         torch::Tensor in_dim_tensor,
+                                         torch::Tensor out_dim_tensor,
+                                         int batch_size,
+                                         double lr,
+                                         int repeats,
+                                         bool debug_vis) {
+    // Reuse the validation and launch path, but wrap in CUDA events inside C++ to avoid
+    // Python-side timing overhead when benchmarking kernel latency.
+    TORCH_CHECK(repeats > 0, "repeats must be > 0");
+
+    cudaEvent_t start, end;
+    TORCH_CHECK(cudaEventCreate(&start) == cudaSuccess, "Failed to create start event");
+    TORCH_CHECK(cudaEventCreate(&end) == cudaSuccess, "Failed to create end event");
+
+    // Warm-up: one launch to prime allocations/TF32 configs, etc.
+    run_linear_training_inplace(
+        instructions_tensor,
+        activations,
+        grad_activations,
+        weights_padded,
+        grad_w,
+        targets,
+        in_dim_tensor,
+        out_dim_tensor,
+        batch_size,
+        lr,
+        debug_vis);
+
+    // Timed loop
+    TORCH_CHECK(cudaEventRecord(start) == cudaSuccess, "Failed to record start event");
+    for (int i = 0; i < repeats; ++i) {
+        run_linear_training_inplace(
+            instructions_tensor,
+            activations,
+            grad_activations,
+            weights_padded,
+            grad_w,
+            targets,
+            in_dim_tensor,
+            out_dim_tensor,
+            batch_size,
+            lr,
+            debug_vis);
+    }
+    TORCH_CHECK(cudaEventRecord(end) == cudaSuccess, "Failed to record end event");
+    TORCH_CHECK(cudaEventSynchronize(end) == cudaSuccess, "Failed to synchronize end event");
+
+    float ms = 0.0f;
+    TORCH_CHECK(cudaEventElapsedTime(&ms, start, end) == cudaSuccess, "Failed to compute elapsed time");
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(end);
+
+    return static_cast<double>(ms) / static_cast<double>(repeats);
+}
+
 PYBIND11_MODULE(linear_training_mk_demo, m) {
     m.def(
         "run",
@@ -981,5 +1251,36 @@ PYBIND11_MODULE(linear_training_mk_demo, m) {
         pybind11::arg("target"),
         pybind11::arg("weights"),
         pybind11::arg("lr"),
+        pybind11::arg("debug") = false);
+    m.def(
+        "run_inplace",
+        &run_linear_training_inplace,
+        "Run MMA-based linear training megakernel on preallocated buffers (no host-side copies)",
+        pybind11::arg("instructions"),
+        pybind11::arg("activations"),
+        pybind11::arg("grad_activations"),
+        pybind11::arg("weights"),
+        pybind11::arg("grad_w"),
+        pybind11::arg("targets"),
+        pybind11::arg("in_dim_tensor"),
+        pybind11::arg("out_dim_tensor"),
+        pybind11::arg("batch_size"),
+        pybind11::arg("lr"),
+        pybind11::arg("debug") = false);
+    m.def(
+        "run_inplace_timed",
+        &run_linear_training_inplace_timed,
+        "Run megakernel inplace and return avg milliseconds over repeats using CUDA events",
+        pybind11::arg("instructions"),
+        pybind11::arg("activations"),
+        pybind11::arg("grad_activations"),
+        pybind11::arg("weights"),
+        pybind11::arg("grad_w"),
+        pybind11::arg("targets"),
+        pybind11::arg("in_dim_tensor"),
+        pybind11::arg("out_dim_tensor"),
+        pybind11::arg("batch_size"),
+        pybind11::arg("lr"),
+        pybind11::arg("repeats") = 1,
         pybind11::arg("debug") = false);
 }
