@@ -735,7 +735,7 @@ struct SgdUpdate {
         static __device__ void run(const linear_training_globals &, state_t &s) {
             // This op doesnt touch pages, we still need to advance parity in page_finished so page
             // users in later instructions dont block on a never-issued arrive when instruction_index
-             parity flips.
+            // parity flips.
             if (kittens::laneid() < C::NUM_PAGES) {
                 auto pid = s.pid(kittens::laneid());
                 s.wait_page_ready(pid);
