@@ -23,7 +23,8 @@ template <typename config> struct NoOp {
     };
     struct loader {
         template <typename globals>
-        static __device__ void run(const globals &g, state<config> &s) {
+        static __device__ void run(const globals &, state<config> &s) {
+            // Placeholder instruction: only advances page parity so later ops don't deadlock on wait_page_ready.
             if (kittens::laneid() < config::NUM_PAGES) { // Release all pages, ASAP.
                 auto pid = s.pid(kittens::laneid());
                 s.wait_page_ready(pid);

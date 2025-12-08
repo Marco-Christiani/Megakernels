@@ -30,6 +30,9 @@ __device__ void main_loop(const globals &g, ::megakernel::state<config> &kvms) {
 
         // Step 0. if the slot was used in the previous iteration, wait for the
         // previous instruction to complete & invalidate its semaphores
+        // (dynamic semaphores live only for the instruction occupying this ring
+        // slot, carrying them across instructions would make TMA completions
+        // race stale phase bits).
         if (kvms.instruction_index >= config::INSTRUCTION_PIPELINE_STAGES) {
             auto last_slot_instruction_index =
                 kvms.instruction_index - config::INSTRUCTION_PIPELINE_STAGES;
