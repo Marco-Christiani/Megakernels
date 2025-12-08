@@ -421,3 +421,82 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+### Milestone A - Implement Option A (phase-ordered) multi-SM training is *correct* and *measurable*
+
+**Definition of done**
+
+* Multi-layer forward+backward+SGD is correct vs PyTorch for >1 layer on **multi-SM** (grid = sm_count).
+* No deadlocks across a sweep of **odd/even** tile counts (the old parity fragility should stay fixed).
+* A benchmark produces **repeatable numbers** (ms/step + a small CSV/JSON log) so you can track changes.
+
+**Work items**
+
+1. **Finalize the Option A phase model (layer × phase)**
+
+   * Define the global phase sequence as a linear chain, e.g.:
+
+     * `FWD(layer=0..L-1)` → `LOSS` → `BWD(layer=L-1..0)` (can bundle `bwd_weight+bwd_input` per layer or keep separate) → `SGD(layer=0..L-1)`
+   * Make phase IDs explicit in `inst[INST_PHASE_ID_IDX]` (do not rely on `opcode_phase()` except as fallback).
+   * Make `phase_counters` **dynamic length** based on `num_layers` and chosen schedule (don’t keep it hard-coded at 5 if you’re doing per-layer barriers).
+
+2. **Instruction builder: per-SM sharding + guaranteed phase participation**
+
+   * For each phase:
+
+     * Enumerate all tiles.
+     * Shard tiles **round-robin across SMs** (or your chosen deterministic scheme).
+     * For any SM with zero work in that phase, insert a **NoOp placeholder** that still:
+
+       * is marked `phase_start=1` and `phase_end=1` for that phase, and
+       * advances page parity (NoOp loader already does this now).
+   * Pad each SM stream so **all SMs have equal instruction count** and meet the VM ring constraints.
+
+3. **Tests that specifically exercise phase skew + deadlock hazards**
+
+   * Add a test where `num_tiles < sm_count` (forces NoOps + phase counters to matter).
+   * Add a test sweep of dims that produce **odd** tile counts in different phases.
+   * Add a multi-layer (>2) test with random seeds to catch ordering assumptions.
+
+4. **Benchmark + profiling harness**
+
+   * Use your `run_inplace_timed()` path and write results as **JSONL or CSV**:
+
+     * `{gpu, sm_count, batch, dims, layers, tile, stages, ms_mean, ms_p50, ms_p95, date, git_sha}`
+   * Keep the harness stable so ncu/nsys deltas are meaningful.
+
+## Your Task implement Option A schedule + builder + tests
+
+You are implementing **Option A (phase-ordered, layer-aware scheduling)** for the multi-SM linear-training megakernel. Priorities are **correctness, contracts, and measurability**. Avoid unrelated refactors; keep changes surgical.
+
+**Goal:** make the system provably correct for multi-layer training on multi-SM by generating a per-SM instruction stream that enforces layer boundaries via phases, and add tests/bench output to lock it in.
+
+**Tasks (in order):**
+
+1. **Phase model:** define a linear global phase sequence that includes per-layer boundaries (e.g., `FWD l0..lL-1 → LOSS → BWD lL-1..l0 → SGD l0..lL-1`, bundling bwd ops per layer if you want fewer phases).
+
+   * Implement explicit `inst[INST_PHASE_ID_IDX]`, `inst[INST_PHASE_START_IDX]`, `inst[INST_PHASE_END_IDX]` for every instruction.
+   * Update `phase_counters` allocation to match the dynamic number of phases.
+2. **Instruction builder:** produce `instructions[sm, t, 32]` where each SM gets disjoint real tiles plus **NoOp placeholders** so that **every SM participates in every phase** (must publish exactly once per phase).
+
+   * If an SM has no real work for a phase, insert a NoOp with `phase_start=1` and `phase_end=1` for that phase.
+   * Ensure all SM streams are the same length; pad with NoOps as needed.
+3. **Tests:** add/extend tests to cover:
+
+   * `num_tiles < sm_count` (forces NoOps + phase counters),
+   * odd tile counts in at least one phase (deadlock regression),
+   * multi-layer correctness vs torch.
+4. **Benchmark logging:** ensure the benchmark outputs a machine-readable line (JSONL or CSV) with key params + measured ms so we can track performance over time. Reference our benchmark.py and test_example.py files. The test file is not production quality yet.
+
+**Hard requirements (do not violate):**
+
+* Keep the MK parity rule intact: page-free instructions (NoOp/LossGrad/SGD) must advance page parity (already implemented—do not regress).
+* TK barriers are CTA-local; cross-SM ordering must rely only on the documented global `phase_counters` protocol.
+* Use existing `kittens::` sync abstractions where available (`warp::sync`, `everyone::sync`, etc.); don’t introduce new raw barriers unless there is no TK equivalent and you document why.
+
+**Deliverables:**
+
+* A concise change report with file+line references for: phase ID scheme, builder logic, and each added test.
+* Paste the test output confirming correctness.
+* Paste one benchmark output line (JSONL/CSV) as the baseline.
