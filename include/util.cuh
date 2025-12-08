@@ -152,6 +152,9 @@ template <typename config> struct state {
         kittens::move<int>::lds(ret, pid_order_shared_addr + lid * sizeof(int));
         return ret;
     }
+    // Parity is derived from instruction_index bits. If any instruction under- or
+    // over-arrives on its expected page_finished count, later waiters can block
+    // forever on a parity value that will never be reached.
     __device__ inline void wait_page_ready(int pid) {
 #pragma unroll
         for (int i = 0; i < config::INSTRUCTION_PIPELINE_STAGES_BITS; i++) {
@@ -160,6 +163,9 @@ template <typename config> struct state {
         }
     }
 
+    // Advances parity only after the full expected arrival count for this
+    // instruction is met. Mismatched arrivals desynchronize parity from
+    // instruction_index and strand later waiters.
     __device__ inline void finish_page(int pid, int count) {
 #pragma unroll
         for (int i = 0; i < config::INSTRUCTION_PIPELINE_STAGES_BITS; i++) {
@@ -257,6 +263,11 @@ constexpr int TEVENT_TRIPLES_OUTPUT_READY = 125;
 #define MK_DEBUG_PRINT_END(msg)
 #endif
 
+template <typename globals, typename state_t>
+__device__ inline void phase_wait_if_needed(const globals &, state_t &) {}
+template <typename globals, typename state_t>
+__device__ inline void phase_publish_if_needed(const globals &, state_t &) {}
+
 #define MAKE_WORKER(name, start_event, is_consumer)                            \
     namespace megakernel {                                                     \
     namespace name {                                                           \
@@ -278,6 +289,7 @@ constexpr int TEVENT_TRIPLES_OUTPUT_READY = 125;
         for (mks.instruction_index = 0, mks.instruction_ring = 0;              \
              mks.instruction_index < num_iters; mks.next_instruction()) {      \
             mks.await_instruction();                                           \
+            phase_wait_if_needed(g, mks);                                      \
             if (kittens::laneid() == 0) {                                               \
                 if (is_consumer) {                                             \
                     mks.record(start_event + 2 * kittens::warpid());                    \
@@ -289,6 +301,7 @@ constexpr int TEVENT_TRIPLES_OUTPUT_READY = 125;
                         ops...>::template run<void, config, globals,           \
                                               ::megakernel::state<config>>(    \
                 mks.instruction()[0], g, mks);                                 \
+            phase_publish_if_needed(g, mks);                                   \
             if (kittens::laneid() == 0) {                                               \
                 if (is_consumer) {                                             \
                     mks.record(start_event + 2 * kittens::warpid() + 1);                \

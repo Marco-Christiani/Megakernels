@@ -28,6 +28,11 @@ using weight_frag_col_t = kittens::rt_bf<K_TILE, N_TILE, kittens::ducks::rt_layo
 using config = linear_training_mk_demo_config;
 using state_t = megakernel::state<config>;
 
+constexpr int PHASE_COUNT = 5;
+constexpr int INST_PHASE_END_IDX = 29;
+constexpr int INST_PHASE_START_IDX = 30;
+constexpr int INST_PHASE_ID_IDX = 31;
+
 enum OpCode : int {
     LINEAR_FWD = 1,
     LOSS_GRAD = 2,
@@ -35,6 +40,28 @@ enum OpCode : int {
     LINEAR_BWD_INPUT = 4,
     SGD_UPDATE = 5
 };
+
+__device__ inline int opcode_phase(int opcode) {
+    switch (opcode) {
+    case LINEAR_FWD:
+        return 0;
+    case LOSS_GRAD:
+        return 1;
+    case LINEAR_BWD_WEIGHT:
+        return 2;
+    case LINEAR_BWD_INPUT:
+        return 3;
+    case SGD_UPDATE:
+        return 4;
+    default:
+        return -1;
+    }
+}
+
+__device__ inline bool is_loader_warp() { return kittens::warpid() == config::NUM_CONSUMER_WARPS; }
+__device__ inline bool is_consumer_leader() {
+    return kittens::warpid() == 0 && kittens::warp::laneid() == 0;
+}
 
 __host__ __device__ constexpr int div_up(int x, int y) {
     return (x + y - 1) / y;
@@ -69,11 +96,63 @@ struct linear_training_globals {
     int max_dim;
     int num_layers;
     int debug_vis;
+    int sm_count;
+    int *phase_counters;
 
-    dim3 grid() const { return dim3(config::NUM_BLOCKS); }
+    dim3 grid() const { return dim3(sm_count); }
     dim3 block() const { return dim3(config::NUM_THREADS); }
     int dynamic_shared_memory() const { return config::DYNAMIC_SHARED_MEMORY; }
 };
+
+__device__ inline int instruction_phase(const int (&inst)[config::INSTRUCTION_WIDTH]) {
+    int phase = inst[INST_PHASE_ID_IDX];
+    if (phase < 0) {
+        phase = opcode_phase(inst[0]);
+    }
+    return phase;
+}
+__device__ inline bool is_phase_start(const int (&inst)[config::INSTRUCTION_WIDTH]) {
+    return inst[INST_PHASE_START_IDX] != 0;
+}
+__device__ inline bool is_phase_end(const int (&inst)[config::INSTRUCTION_WIDTH]) {
+    return inst[INST_PHASE_END_IDX] != 0;
+}
+
+template <>
+__device__ inline void phase_wait_if_needed<linear_training_globals, state_t>(
+    const linear_training_globals &g, state_t &s) {
+    const auto &inst = s.instruction();
+    int phase = instruction_phase(inst);
+    if (!is_phase_start(inst) || phase <= 0) {
+        return;
+    }
+    if (!is_loader_warp()) {
+        return;
+    }
+    if (kittens::warp::laneid() == 0) {
+        volatile int *counter = g.phase_counters + (phase - 1);
+        while (atomicAdd((int *)counter, 0) < g.sm_count) {
+        }
+    }
+    kittens::warp::sync();
+    kittens::everyone::sync(15);
+}
+
+template <>
+__device__ inline void phase_publish_if_needed<linear_training_globals, state_t>(
+    const linear_training_globals &g, state_t &s) {
+    const auto &inst = s.instruction();
+    int phase = instruction_phase(inst);
+    if (!is_phase_end(inst)) {
+        return;
+    }
+    kittens::everyone::sync(15);
+    if (!is_consumer_leader()) {
+        return;
+    }
+    __threadfence();
+    atomicAdd(g.phase_counters + phase, 1);
+}
 
 template <typename Config, typename Globals>
 struct two_page_pipeline {
@@ -953,6 +1032,10 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
             1,
             num_layers);
 
+    const int sm_count = static_cast<int>(instructions_tensor.size(0));
+    auto phase_counters =
+        torch::zeros({PHASE_COUNT}, torch::TensorOptions().dtype(torch::kInt32).device(instructions_tensor.device()));
+
     linear_training_globals g{
         inst_layout,
         timing_layout,
@@ -968,19 +1051,21 @@ std::vector<torch::Tensor> run_linear_training(torch::Tensor instructions_tensor
         padded_batch,
         max_dim,
         num_layers,
-        debug_vis ? 1 : 0};
+        debug_vis ? 1 : 0,
+        sm_count,
+        phase_counters.data_ptr<int>()};
 
-    if constexpr (config::HOST_DEBUG_LOG) {
-        if (debug_vis) {
-            std::cout << "[linear-training host] launching kernel with batch_size=" << batch_size
-                      << " lr=" << lr
-                      << " layers=" << num_layers
-                      << " debug=" << (debug_vis ? "true" : "false") << std::endl;
-        }
+    if (debug_vis) {
+        std::cout << "[linear-training host] launching kernel with batch_size=" << batch_size
+                  << " lr=" << lr
+                  << " layers=" << num_layers
+                  << " sm_count=" << sm_count
+                  << " instr_shape=" << instructions_tensor.sizes() << std::endl;
     }
 
     megakernel::mk<config,
                    linear_training_globals,
+                   megakernel::NoOp<config>,
                    LinearFwd<config>,
                    LossGrad<config>,
                    LinearBwdWeight<config>,
@@ -1150,6 +1235,10 @@ void run_linear_training_inplace(torch::Tensor instructions_tensor,
             1,
             static_cast<int>(out_dim_tensor.numel()));
 
+    const int sm_count = static_cast<int>(instructions_tensor.size(0));
+    auto phase_counters =
+        torch::zeros({PHASE_COUNT}, torch::TensorOptions().dtype(torch::kInt32).device(instructions_tensor.device()));
+
     linear_training_globals g{
         inst_layout,
         timing_layout,
@@ -1165,10 +1254,13 @@ void run_linear_training_inplace(torch::Tensor instructions_tensor,
         padded_batch,
         max_dim,
         num_layers,
-        debug_vis ? 1 : 0};
+        debug_vis ? 1 : 0,
+        sm_count,
+        phase_counters.data_ptr<int>()};
 
     megakernel::mk<config,
                    linear_training_globals,
+                   megakernel::NoOp<config>,
                    LinearFwd<config>,
                    LossGrad<config>,
                    LinearBwdWeight<config>,
