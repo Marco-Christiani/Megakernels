@@ -19,3 +19,16 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+
+.pytest_cache
+.ruff_cache
+*.nsys*
+*.ncu*
+*.out
+.env
+__pycache__/
+*.egg-info/
+*.bak*
+*.tar*
+
+profiles/

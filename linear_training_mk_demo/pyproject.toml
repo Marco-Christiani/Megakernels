@@ -7,3 +7,17 @@ name = "linear_training_mk_demo"
 version = "0.0.1"
 description = "Linear training megakernel demo."
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+]
+
+[[tool.uv.index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
