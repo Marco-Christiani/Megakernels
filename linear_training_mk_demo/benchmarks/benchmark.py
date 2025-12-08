@@ -1,4 +1,5 @@
 import argparse
+from enum import Enum
 import math
 import os
 import statistics
@@ -116,7 +117,10 @@ class RunOnceResult(NamedTuple):
     timings_pt: list[float]
 
 
-
+class Scenario(Enum):
+    MEGAKERNEL = 1
+    PYTORCH = 2
+    ALL = 3
 
 def run_once(
     batch: int,
@@ -126,6 +130,7 @@ def run_once(
     steps: int,
     warmup: int,
     lr: float,
+    scenario: Scenario = Scenario.ALL,
 ) -> RunOnceResult:
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -138,71 +143,68 @@ def run_once(
         num_layers, out_dim, in_dim, device=device, dtype=torch.float32
     )
     weights_pt = weights.clone()
-
-    instructions = shard_instructions(
-        build_single_queue(batch, in_dim, out_dim, num_layers, device),
-        props.multi_processor_count,
-        device,
-    )
+    timings_mk: List[float] = []
 
     # ---------- megakernel run ----------
-    timings_mk: List[float] = []
-    for i in range(warmup + steps):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+    if scenario in (Scenario.MEGAKERNEL, Scenario.ALL):
+        instructions = shard_instructions(
+            build_single_queue(batch, in_dim, out_dim, num_layers, device),
+            props.multi_processor_count,
+            device,
+        )
 
-        if i >= warmup:
-            torch.cuda.nvtx.range_push(f"megakernel-run-{i}")
-            start.record()
+        for i in range(warmup + steps):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
 
-        linear_training_mk_demo.run(instructions, x, target, weights, lr, False)
+            if i >= warmup:
+                torch.cuda.nvtx.range_push(f"megakernel-run-{i}")
+                start.record()
 
-        if i >= warmup:
-            end.record()
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.synchronize()
-            elapsed = start.elapsed_time(end)
-            timings_mk.append(elapsed)
+            linear_training_mk_demo.run(instructions, x, target, weights, lr, False)
+
+            if i >= warmup:
+                end.record()
+                torch.cuda.nvtx.range_pop()
+                elapsed = start.elapsed_time(end)
+                timings_mk.append(elapsed)
 
     # ---------- PyTorch training run ----------
-    weights_pt.requires_grad_(True)
-    x.requires_grad_(True)
-    opt = torch.optim.SGD(params=[weights_pt], lr=lr)
-
     timings_pt: List[float] = []
-    for i in range(warmup + steps):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+    if scenario in (Scenario.PYTORCH, Scenario.ALL):
+        weights_pt.requires_grad_(True)
+        x.requires_grad_(True)
+        opt = torch.optim.SGD(params=[weights_pt], lr=lr)
 
-        if i >= warmup:
-            torch.cuda.nvtx.range_push(f"torch-run-{i}")
-            start.record()
+        for i in range(warmup + steps):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
 
-        opt.zero_grad()
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = x
-            for l in range(num_layers):
-                out = torch.nn.functional.linear(input=out, weight=weights_pt[l])
-                # out = out @ weights_pt[l].t()
-                # act = act @ weights[l].t()
-            loss = torch.nn.functional.mse_loss(input=out, target=target)
+            if i >= warmup:
+                torch.cuda.nvtx.range_push(f"torch-run-{i}")
+                start.record()
 
-            # typically not done in autocast but done to be a bit closer to the mk path
-            loss.backward()
-            opt.step()
-            # loss = ((out.to(torch.float32) - target) ** 2).sum() / batch
+            opt.zero_grad()
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = x
+                for l in range(num_layers):
+                    out = torch.nn.functional.linear(input=out, weight=weights_pt[l])
+                    # out = out @ weights_pt[l].t()
+                    # act = act @ weights[l].t()
+                loss = torch.nn.functional.mse_loss(input=out, target=target)
 
-        if i >= warmup:
-            end.record()
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.synchronize()
-            elapsed = start.elapsed_time(end)
-            timings_pt.append(elapsed)
+                # typically not done in autocast but done to be a bit closer to the mk path
+                loss.backward()
+                opt.step()
+                # loss = ((out.to(torch.float32) - target) ** 2).sum() / batch
+
+            if i >= warmup:
+                end.record()
+                torch.cuda.nvtx.range_pop()
+                elapsed = start.elapsed_time(end)
+                timings_pt.append(elapsed)
 
     return RunOnceResult(timings_mk=timings_mk, timings_pt=timings_pt)
-
-
-
 
 
 def main() -> None:
@@ -251,7 +253,29 @@ def main() -> None:
         default=env_float("LINEAR_BENCH_LR", 0.01),
         help="Learning rate (env: LINEAR_BENCH_LR)",
     )
+    parser.add_argument(
+        "--pt",
+        action="store_true",
+        required=False,
+        help="Only run pytorch",
+    )
+    parser.add_argument(
+        "--mk",
+        action="store_true",
+        required=False,
+        help="Only run megakernel",
+    )
+    parser.add_argument(
+        "-d",
+        action="store_true",
+        required=False,
+        help="Dry run",
+    )
     args = parser.parse_args()
+    assert not (args.pt and args.mk), "--pt and --mk are mutually exclusive"
+    if args.d:
+        print("Dry run, nothing to do.")
+        return
 
     def show(timings_ms: List[float], name: str) -> None:
         if not timings_ms:
@@ -278,6 +302,7 @@ def main() -> None:
         )
         print(summary)
 
+    scenario = Scenario.MEGAKERNEL if args.mk else Scenario.PYTORCH if args.pt else Scenario.ALL
     result = run_once(
         args.batch,
         args.in_dim,
@@ -286,9 +311,12 @@ def main() -> None:
         args.steps,
         args.warmup,
         args.lr,
+        scenario=scenario,
     )
-    show(result.timings_mk, name="mk")
-    show(result.timings_pt, name="pt")
+    if scenario in (Scenario.MEGAKERNEL, Scenario.ALL):
+        show(result.timings_mk, name="mk")
+    if scenario in (Scenario.PYTORCH, Scenario.ALL):
+        show(result.timings_pt, name="pt")
 
 
 if __name__ == "__main__":
