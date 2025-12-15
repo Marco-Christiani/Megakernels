@@ -10,9 +10,9 @@ from torch.amp.autocast_mode import autocast
 
 import linear_training_mk_demo
 
-M_TILE = 16
-N_TILE = 16
-K_TILE = 16
+M_TILE = 32
+N_TILE = 32
+K_TILE = 32
 
 
 def env_int(name: str, default: int) -> int:
@@ -207,71 +207,128 @@ def run_once(
     return RunOnceResult(timings_mk=timings_mk, timings_pt=timings_pt)
 
 
+def run_grid():
+    def show(timings_ms: List[float], name: str, batch: int, in_dim: int, out_dim: int, num_layers: int) -> None:
+        if not timings_ms:
+            print(f"[{name}] no timings collected")
+            return
+
+        n = len(timings_ms)
+        avg_ms = statistics.mean(timings_ms)
+        p50 = statistics.median(timings_ms)
+        sorted_ts = sorted(timings_ms)
+        idx95 = min(n - 1, math.floor(0.95 * n))
+        p95 = sorted_ts[idx95]
+
+        gflops = gflops_forward_backward(
+            batch, in_dim, out_dim, num_layers
+        )
+        # giga-ops per run (total_ops / 1e9) to tflops = (gigaops / seconds) / 1000
+        tflops = (gflops / (avg_ms / 1000.0)) / 1000.0
+
+        summary = (
+            f"[{name}] batch={batch} in_dim={in_dim} out_dim={out_dim} "
+            f"layers={num_layers} avg_ms={avg_ms:.3f} p50_ms={p50:.3f} "
+            f"p95_ms={p95:.3f} est_tflops={tflops:.3f}"
+        )
+        print(summary)
+    batches = [b for b in [4, 16, 64] if b % M_TILE == 0]
+    dims = [d for d in [64, 256, 1024] if d % K_TILE == 0]
+    layers = [2, 4, 8]
+
+    for batch in batches:
+        for dim in dims:
+            in_dim = dim
+            out_dim = dim
+            for num_layers in layers:
+                print()
+                result = run_once(
+                    batch,
+                    in_dim,
+                    out_dim,
+                    num_layers,
+                    steps=10,
+                    warmup=2,
+                    lr=0.01,
+                    scenario=Scenario.ALL,
+                )
+                show(result.timings_mk, name="mk", batch=batch, in_dim=in_dim, out_dim=out_dim, num_layers=num_layers)
+                show(result.timings_pt, name="pt", batch=batch, in_dim=in_dim, out_dim=out_dim, num_layers=num_layers)
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark the linear training megakernel."
     )
-    parser.add_argument(
+    sp = parser.add_subparsers(dest="mode", required=True)
+    all_sp = sp.add_parser("all")
+    one_sp = sp.add_parser("one")
+
+    one_sp.add_argument(
         "--batch",
         type=int,
         default=env_int("LINEAR_BENCH_BATCH", 4),
         help="Batch size (env: LINEAR_BENCH_BATCH)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--in-dim",
         type=int,
         default=env_int("LINEAR_BENCH_IN_DIM", 64),
         help="Input dimension (env: LINEAR_BENCH_IN_DIM)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--out-dim",
         type=int,
         default=env_int("LINEAR_BENCH_OUT_DIM", 64),
         help="Output dimension (env: LINEAR_BENCH_OUT_DIM)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--num-layers",
         type=int,
         default=env_int("LINEAR_BENCH_NUM_LAYERS", 2),
         help="Number of layers (env: LINEAR_BENCH_NUM_LAYERS)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--steps",
         type=int,
         default=env_int("LINEAR_BENCH_STEPS", 10),
         help="Benchmark steps (env: LINEAR_BENCH_STEPS)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--warmup",
         type=int,
         default=env_int("LINEAR_BENCH_WARMUP", 2),
         help="Warmup iterations (env: LINEAR_BENCH_WARMUP)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--lr",
         type=float,
         default=env_float("LINEAR_BENCH_LR", 0.01),
         help="Learning rate (env: LINEAR_BENCH_LR)",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--pt",
         action="store_true",
         required=False,
         help="Only run pytorch",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "--mk",
         action="store_true",
         required=False,
         help="Only run megakernel",
     )
-    parser.add_argument(
+    one_sp.add_argument(
         "-d",
         action="store_true",
         required=False,
         help="Dry run",
     )
     args = parser.parse_args()
+    if args.mode == "all":
+        run_grid()
+        return
     assert not (args.pt and args.mk), "--pt and --mk are mutually exclusive"
     if args.d:
         print("Dry run, nothing to do.")

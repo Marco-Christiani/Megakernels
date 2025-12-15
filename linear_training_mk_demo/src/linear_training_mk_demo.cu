@@ -12,9 +12,9 @@
 #include <vector>
 
 // Tile geometry for all MMA paths
-constexpr int M_TILE = 16;
-constexpr int N_TILE = 16;
-constexpr int K_TILE = 16;
+constexpr int M_TILE = 32;
+constexpr int N_TILE = 32;
+constexpr int K_TILE = 32;
 
 using activ_tile_t = kittens::st_fl<M_TILE, K_TILE>;
 using weight_tile_fwd_t = kittens::st_fl<N_TILE, K_TILE>;   // weights for forward (N x K)
